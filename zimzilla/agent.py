@@ -32,6 +32,7 @@ Events yielded
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 import re
 from dataclasses import dataclass
@@ -74,6 +75,7 @@ MAX_OUTPUT_CEILING = 131072
 _WINDOW_WORDS = (
     "per-minute", "per minute", "hourly", "per hour", "daily", "per day",
     "weekly", "per week", "allowance", "quota", "come back",
+    "limit: 0", "requests per minute", "requests per day",
     # Logfare's own wording, and the one this list missed. Its upstream
     # answers "Your account has reached its request budget. Try again later."
     # with no Retry-After at all on the proxied path, so a 429 carrying that
@@ -92,14 +94,13 @@ def _rate_limit_is_a_window(e: Exception) -> bool:
     and they want opposite responses — back off briefly, versus stop and say
     when it clears.
     """
-    text = ""
+    # Gemini's compatibility API has returned both objects and arrays for an
+    # error body. Search the rendered exception as well as the usual dict
+    # fields so nested quota/rate descriptions are not mistaken for bursts.
+    text = str(e).lower()
     body = getattr(e, "body", None)
-    if isinstance(body, dict):
-        err = body.get("error")
-        if isinstance(err, dict):
-            text = str(err.get("message") or "")
-        text += " " + str(body.get("message") or "")
-    text = text.lower()
+    if body is not None:
+        text += " " + str(body).lower()
     if any(w in text for w in _WINDOW_WORDS):
         return True
     # A reset header at least a minute out is a window by construction.
@@ -304,6 +305,10 @@ searching the web, and seeing it. Work directly and decisively:
 - Run the project's tests or build after changing code, and report real results.
 - Batch independent tool calls into a single turn when they don't depend on each other.
 - Keep prose short. Lead with what you did and what you found.
+- For greetings, acknowledgments, and simple conversation, answer directly. Do
+  not inspect the workspace or call tools unless the user asks or the task
+  genuinely requires it. "Inspect before you change" applies only when a change
+  has actually been requested.
 - When you do not know something — a library's API, an unfamiliar error, a
   current version — use search_web and then web_fetch to read the source
   rather than guessing from memory. Say what you looked up.
@@ -381,19 +386,22 @@ something is missing:
   Never ask the operator to export a key or install a CLI for a capability the
   harness already has; the profile is already on disk:
 {profiles}
-- Long security jobs have a slash command. Slash commands are operator-entered,
-  so you cannot run one — when a task needs one, name the command instead of
-  reproducing it by hand: /osint (recon), /leadgen (local leads, passive audit,
-  outreach drafts), /bug-hunt (a scouting wave), /ad (Active Directory), /crack
-  (offline hashes), /reverse-engineer, and the /shodan-* family below.
+- Long security jobs have a slash command. When answering the operator directly,
+  name the relevant command instead of reproducing that whole workflow. When you
+  are already running as a worker inside one of those commands, do the assigned
+  work with your tools; never tell the operator to launch the command that is
+  already running. `/bug-hunt` is an adaptive multi-wave assessment, not merely
+  a scouting wave. Other commands include /osint, /leadgen, /ad, /crack,
+  /reverse-engineer, and the /shodan-* family below.
 {shodan}"""
 
 # Appended per-mode so the model knows what it is and is not allowed to do.
 MODE_PROMPTS = {
     "auto": (
-        "\n\nMODE: auto. File creates and edits are auto-approved. Shell "
-        "commands require the operator's confirmation, so prefer targeted "
-        "commands and explain destructive ones."
+        "\n\nMODE: auto. File creates, edits, and shell commands are "
+        "auto-approved by this mode, subject to the scope guard and tool policy. "
+        "Run targeted commands that directly advance the task; avoid unnecessary "
+        "or destructive actions."
     ),
     "edits": (
         "\n\nMODE: edits. You may read, create and edit files freely, but the "
@@ -759,6 +767,11 @@ class Agent:
         #: The operator's remembered preferences, folded into the system prompt.
         #: The UI refreshes it after learning something new; empty means none.
         self.memory_note: str = ""
+        # Stable across turns. Building the environment note imports provider
+        # modules and reads local metadata, which should not delay each first
+        # token by being repeated for every request.
+        self._system_prompt_cache: str | None = None
+        self._tool_schema_cache: list[dict] | None = None
         #: Facts buffered by ``notice``, folded into the next turn's user text.
         #: Not appended to ``messages`` directly — see ``notice``.
         self._notices: list[str] = []
@@ -822,6 +835,9 @@ class Agent:
         #: does not, and the 400 is the authority. Once set, every later
         #: request uses `{"type": "adaptive"}` + `output_config.effort`.
         self._adaptive_thinking: bool = False
+        # Colibri's local models can take a long time to prefill a large tool
+        # catalog. Ordinary conversation does not need those function schemas.
+        self._effort_explicit = cfg.reasoning_effort is not None
         #: Set once the endpoint has refused an image. A text-only route should
         #: degrade to reading the text the tool also returned, not fail the
         #: turn — so the first image rejection strips every image from the
@@ -852,13 +868,14 @@ class Agent:
                 # raises the same ``anthropic`` exceptions, so everything the
                 # loop does above this line is unchanged.
                 from . import openai_compat
-
+                from . import sources as sources_mod
+                is_colibri = sources_mod.active_key(self.cfg.base_url) == "coli"
                 self._client = openai_compat.Client(
                     base_url=self.cfg.base_url,
                     # A bearer token is the OpenAI convention, and it is the
                     # same credential the local proxies are started with.
                     api_key=self.cfg.auth_token or self.cfg.api_key,
-                    timeout=self.cfg.request_timeout,
+                    timeout=None if is_colibri else self.cfg.request_timeout,
                     stream=self.cfg.openai_stream,
                     extra_headers=self.cfg.extra_headers,
                 )
@@ -904,6 +921,7 @@ class Agent:
 
     def set_model(self, model: str) -> None:
         self.cfg.model = model
+        self._tool_schema_cache = None
         # A new model may be able to see, and the previous one's refusal is not
         # evidence about this one. Forgetting the flag is what lets a session
         # switch from a text-only route to a vision model without restarting.
@@ -914,6 +932,8 @@ class Agent:
 
         if mode in MODES:
             self.cfg.mode = mode
+            self._invalidate_system_prompt()
+            self._tool_schema_cache = None
 
     # ---- mode policy ------------------------------------------------------
     def _mode_policy(self) -> dict:
@@ -939,6 +959,8 @@ class Agent:
 
     def tool_schemas(self) -> list[dict]:
         """The tool set advertised to the model for the current mode."""
+        if self._tool_schema_cache is not None:
+            return self._tool_schema_cache
         deny = self._mode_policy().get("deny", set())
         if not self.can_report:
             deny = deny | tools_mod.HUNT_ONLY_TOOLS
@@ -969,7 +991,42 @@ class Agent:
         # reason the LDXHub job tools are withheld without a key.
         from . import mcp as mcp_mod
         schemas = schemas + mcp_mod.registry().schemas()
-        return [t for t in schemas if not self._schema_denied(t["name"], deny)]
+        self._tool_schema_cache = [
+            t for t in schemas if not self._schema_denied(t["name"], deny)
+        ]
+        return self._tool_schema_cache
+
+    def _colibri_needs_tools(self) -> bool:
+        """Skip tool schemas on plain chat turns to reduce Colibri prefill."""
+        text = ""
+        for message in reversed(self.messages):
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text = " ".join(
+                    str(block.get("text", "")) for block in content
+                    if isinstance(block, dict) and block.get("type") == "text")
+            break
+        if not text:
+            return False
+        # Tool schemas are included for requests that ask ZimZilla to inspect,
+        # change, run, search, browse, or otherwise act. URLs and file paths
+        # also signal an action even when the verb is implicit.
+        action = re.search(
+            r"\b(?:open|read|write|create|edit|delete|remove|search|scan|"
+            r"analy[sz]e|inspect|check|run|execute|install|clone|download|"
+            r"send|browse|visit|fetch|find|compare|fix|debug|launch|start|"
+            r"ouvre|lire|lis|écris|ecris|crée|cree|modifie|édite|edite|"
+            r"supprime|efface|cherche|recherche|scanne|analyse|inspecte|"
+            r"vérifie|verifie|lance|exécute|execute|installe|clone|"
+            r"télécharge|telecharge|envoie|navigue|visite|récupère|"
+            r"recupere|trouve|corrige|débbugue|debogue|dns-recon|port-scan|"
+            r"tls-audit|dir-brute|vhost-enum)\b|https?://|(?:[A-Za-z]:\\|/mnt/|~/|\./)",
+            text, re.IGNORECASE)
+        return action is not None
 
     @staticmethod
     def _schema_denied(name: str, deny: set) -> bool:
@@ -1029,11 +1086,30 @@ class Agent:
     def clear(self) -> None:
         self.messages.clear()
         self._summary = ""
+        self._invalidate_system_prompt()
 
     def system_prompt(self) -> str:
+        if self._system_prompt_cache is not None:
+            return self._system_prompt_cache
         note = getattr(self, "memory_note", "")
         memory = ("\n\n---\n\n" + note) if note else ""
-        return self._base_system_prompt() + self._summary_note() + memory
+        language = (
+            "\n\nLANGUE DE RÉPONSE — CONSIGNE PRIORITAIRE\n"
+            "Communique toujours avec l’utilisateur en français : réponses, "
+            "explications, questions, résumés et texte de réflexion visible dans "
+            "l’interface. Ne passe pas à l’anglais parce que l’utilisateur a écrit "
+            "un mot anglais ou parce que les instructions précédentes sont en "
+            "anglais. Garde les commandes, noms d’API, citations et contenus "
+            "demandés dans leur langue d’origine lorsque c’est nécessaire; "
+            "explique-les en français."
+        )
+        self._system_prompt_cache = (
+            self._base_system_prompt() + self._summary_note() + memory + language
+        )
+        return self._system_prompt_cache
+
+    def _invalidate_system_prompt(self) -> None:
+        self._system_prompt_cache = None
 
     def _summary_note(self) -> str:
         """The compacted-history recap, as a tail on the system prompt.
@@ -1253,6 +1329,16 @@ class Agent:
         image_paths: list[str] | None = None,
     ) -> AsyncIterator[dict]:
         self.turn_count += 1
+        # Used below when repairing malformed Gemini parallel tool calls.
+        # Keep this in run_turn's scope as well as _stream_once's request scope.
+        gemini_thinking = False
+        try:
+            from . import sources as sources_mod
+            if sources_mod.active_key(self.cfg.base_url) == "gemini":
+                from . import gemini as gemini_mod
+                gemini_thinking = gemini_mod.is_thinking(self.cfg.model)
+        except Exception:  # noqa: BLE001 - provider hint must not break a turn
+            pass
         turn_in = 0
         turn_out = 0
         turn_cost = 0.0
@@ -1556,15 +1642,36 @@ class Agent:
                 block.input = tools_mod.coerce_args(
                     block.name, dict(block.input or {}))
 
-            # ---- store assistant turn verbatim
-            depth = len(self.messages)
-            content = [self._block_to_dict(b) for b in final.content]
-            self.messages.append({"role": "assistant", "content": content})
-
             # ---- collect tool calls
             tool_calls = [
                 b for b in final.content if getattr(b, "type", None) == "tool_use"
             ]
+            if gemini_thinking and len(tool_calls) > 1:
+                def has_signature(block) -> bool:
+                    signature = getattr(block, "thought_signature", None)
+                    extra = getattr(block, "extra_content", None)
+                    google = extra.get("google") if isinstance(extra, dict) else None
+                    return bool(signature or (isinstance(google, dict)
+                                               and google.get("thought_signature")))
+
+                signed_calls = [call for call in tool_calls if has_signature(call)]
+                if signed_calls and len(signed_calls) != len(tool_calls):
+                    # Gemini 3 has returned parallel calls without signatures
+                    # for some parts. Submit one valid signed call at a time;
+                    # after its result Gemini can request the remaining work
+                    # without replaying malformed functionCall parts.
+                    selected = signed_calls[0]
+                    final.content[:] = [
+                        block for block in final.content
+                        if getattr(block, "type", None) != "tool_use"
+                        or block is selected
+                    ]
+                    tool_calls = [selected]
+
+            # ---- store the assistant turn after any provider-specific repair
+            depth = len(self.messages)
+            content = [self._block_to_dict(b) for b in final.content]
+            self.messages.append({"role": "assistant", "content": content})
 
             # Why the model stopped. Read nowhere before this, which is how a
             # reply cut off at max_tokens mid-``Write`` became indistinguishable
@@ -1935,18 +2042,50 @@ class Agent:
 
         attempt = 0
         max_attempts = 5
+        # Colibri is a local model host. Connection failures are commonly a
+        # startup race while its Windows server is loading; keep waiting and
+        # reconnecting instead of showing noisy retry warnings or giving up.
+        is_colibri = False
+        is_gemini = False
+        try:
+            from . import sources as sources_mod
+            is_colibri = sources_mod.active_key(self.cfg.base_url) == "coli"
+            is_gemini = sources_mod.active_key(self.cfg.base_url) == "gemini"
+        except Exception:  # noqa: BLE001 - retry policy must not mask a request
+            pass
+        gemini_thinking = False
+        if is_gemini:
+            try:
+                from . import gemini as gemini_mod
+                gemini_thinking = gemini_mod.is_thinking(self.cfg.model)
+            except Exception:  # noqa: BLE001 - provider hint must not break a turn
+                pass
         ceiling = self.output_ceiling() if max_tokens is None else max_tokens
         while True:
             try:
+                tools_offered = not is_colibri or self._colibri_needs_tools()
+                system = self.system_prompt()
+                if is_colibri and not tools_offered:
+                    system += (
+                        "\n\nThis is a simple conversation turn and no tools are "
+                        "available. Answer the user directly; do not inspect the "
+                        "workspace, claim that you ran commands, or print tool-call "
+                        "markup."
+                    )
+                if gemini_thinking:
+                    system += (
+                        "\n\nFor this Gemini model, call only one function in "
+                        "each response. Wait for its result before requesting another."
+                    )
                 kwargs: dict = {
                     "model": self.cfg.model,
                     "max_tokens": ceiling,
-                    "system": self.system_prompt(),
+                    "system": system,
                     # Image placeholders become base64 blocks here, and only
                     # here: the loop stores paths, both transports need bytes,
                     # and this is the one point every request passes through.
                     "messages": images_mod.materialise(self.messages),
-                    "tools": self.tool_schemas(),
+                    "tools": self.tool_schemas() if tools_offered else [],
                 }
                 # temperature/top_p were removed from the typed signature in
                 # recent SDKs, so pass them through extra_body (merged into the
@@ -1974,9 +2113,14 @@ class Agent:
                 # ceiling leaves no room for a legal thinking budget, so a
                 # session that never ran /effort sends exactly what it did
                 # before the command existed.
-                if self.cfg.reasoning_effort:
+                effort = self.cfg.reasoning_effort
+                if is_colibri and not self._effort_explicit and not effort:
+                    # Colibri accepts OpenAI reasoning_effort; low keeps the
+                    # local model from spending unnecessary time on casual chat.
+                    effort = "low"
+                if effort:
                     extra.update(effort_mod.body(
-                        self.cfg.reasoning_effort, self.protocol, ceiling,
+                        effort, self.protocol, ceiling,
                         model=self.cfg.model,
                         adaptive=self._adaptive_thinking))
                 for _p in self._dropped_params:
@@ -2009,6 +2153,15 @@ class Agent:
                                 yield ({"type": "reasoning_delta",
                                         "text": getattr(delta, "thinking", "") or ""}, None)
                     final = await stream.get_final_message()
+                    # Colibri can print its trained XML tool syntax even when
+                    # this request advertised no tools (e.g. a greeting). The
+                    # adapter can recover that syntax on action turns, but an
+                    # unrequested hallucinated call must never be executable.
+                    if is_colibri and not tools_offered:
+                        final.content[:] = [
+                            block for block in final.content
+                            if getattr(block, "type", None) != "tool_use"
+                        ]
                     yield (None, final)
                     return
             except anthropic.BadRequestError as e:
@@ -2059,19 +2212,20 @@ class Agent:
                 if isinstance(e, anthropic.RateLimitError) and _rate_limit_is_a_window(e):
                     raise
                 attempt += 1
-                if attempt >= max_attempts:
+                if not is_colibri and attempt >= max_attempts:
                     raise
-                delay = min(2 ** attempt + random.uniform(0, 1.5), 30)
-                yield (
-                    {
-                        "type": "retry",
-                        "attempt": attempt,
-                        "max": max_attempts,
-                        "delay": delay,
-                        "reason": type(e).__name__,
-                    },
-                    None,
-                )
+                delay = min(2 ** min(attempt, 5) + random.uniform(0, 1.5), 30)
+                if not is_colibri:
+                    yield (
+                        {
+                            "type": "retry",
+                            "attempt": attempt,
+                            "max": max_attempts,
+                            "delay": delay,
+                            "reason": type(e).__name__,
+                        },
+                        None,
+                    )
                 await asyncio.sleep(delay)
             except anthropic.APIStatusError as e:
                 status = getattr(e, "status_code", 0)
@@ -2163,6 +2317,16 @@ class Agent:
                 "proxy may not offer that name."
             )
         if isinstance(e, anthropic.RateLimitError):
+            try:
+                from . import sources as sources_mod
+                if sources_mod.active_key(base_url) == "gemini":
+                    from . import gemini as gemini_mod
+                    detail = getattr(e, "body", None) or str(e)
+                    if not isinstance(detail, str):
+                        detail = json.dumps(detail, ensure_ascii=False)
+                    return "Gemini: " + gemini_mod.explain_error(429, detail)
+            except Exception:  # noqa: BLE001 - provider hint must not mask a 429
+                pass
             # A free tier is throttled per model, not per account, so the fix is
             # usually a different free model rather than waiting — measured on
             # OpenRouter, where three free models answered 429 while the other
@@ -2244,6 +2408,15 @@ class Agent:
                     "/compact, or switch to a longer-context model with /model."
                 )
             msg = str(e)
+            if ("thought_signature" in msg.lower()
+                    and "missing" in msg.lower()):
+                return (
+                    "Gemini a renvoyé un appel d’outil sans sa thought_signature. "
+                    "ZimZilla sérialise maintenant les appels Gemini signés quand "
+                    "la réponse parallèle est incomplète ; si l’erreur persiste, "
+                    "essaie un modèle Gemini 2.5 ou recolle le message complet.\n  "
+                    + msg[:240]
+                )
             # Checked before the model-name test: a parameter rejection names
             # the model too ("`temperature` is deprecated for this model"), so
             # testing for "model" first reported a perfectly good model name as
@@ -2262,6 +2435,20 @@ class Agent:
             return f"bad request: {msg[:300]}"
         if isinstance(e, anthropic.APIConnectionError):
             where = e.request.url if getattr(e, "request", None) else "?"
+            try:
+                from . import sources as sources_mod
+                if sources_mod.active_key(base_url) == "gemini":
+                    cause = getattr(e, "__cause__", None)
+                    detail = f" Transport detail: {cause}." if cause else ""
+                    return (
+                        "cannot connect to Google's Gemini API at "
+                        f"{where}. The endpoint URL is formed correctly; check "
+                        "WSL internet access, DNS, TLS inspection, or proxy settings. "
+                        "Changing models will not fix a network connection failure."
+                        f"{detail}"
+                    )
+            except Exception:  # noqa: BLE001 - a diagnostic must not mask the error
+                pass
             # Which protocol was on the wire decides what to check. Telling an
             # operator to start the LiteLLM proxy when the session is aimed at
             # a Chat Completions host is the wrong machine entirely.
@@ -2402,7 +2589,17 @@ class Agent:
         cold cache or an unknown source means the configured value, which is
         what every model without a published limit has always used.
         """
-        return self.published_output_ceiling() or self.cfg.max_tokens
+        ceiling = self.published_output_ceiling() or self.cfg.max_tokens
+        try:
+            from . import sources as sources_mod
+            if sources_mod.active_key(self.cfg.base_url) == "coli":
+                # Leave room for the prompt and tool results inside Colibri's
+                # finite context; the global config's 32768 default is larger
+                # than this model's entire 16384-token window.
+                ceiling = min(ceiling, max(1024, self.context_window() // 4))
+        except Exception:  # noqa: BLE001 - a conservative cap must not break turns
+            pass
+        return ceiling
 
     def _prices(self) -> tuple[float, float]:
         """``(in, out)`` per Mtok for the current model.
@@ -2878,5 +3075,6 @@ class Agent:
                 summary = summary[: max(0, room - len(mark))] + mark
 
         self._summary = prefix + summary
+        self._invalidate_system_prompt()
         self.messages = []
         return True, summary

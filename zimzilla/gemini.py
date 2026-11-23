@@ -77,6 +77,7 @@ API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
 #: The model catalog. **Key-gated** — 404 without a credential — which is what
 #: makes the switch probe a real key check rather than a formality.
 MODELS_URL = f"{API_BASE_URL}/models"
+QUOTA_STATE = ZIMZILLA_HOME / "gemini" / "quota-models.json"
 
 #: The profile ``/gemini-api-setup`` writes and every lookup reads.
 PROFILE = ZIMZILLA_HOME / "gemini" / "source"
@@ -545,6 +546,72 @@ def cached_ids() -> list[str] | None:
     if models is None:
         return None
     return [m.id for m in models if m.free]
+
+
+def quota_limited_models(*, now: float | None = None) -> set[str]:
+    """Models that returned a daily quota error in the last 24 hours.
+
+    Persisting this small, non-secret cache prevents the next campaign (or a
+    restarted CLI) from immediately retrying the same exhausted model.
+    """
+    now = time.time() if now is None else now
+    try:
+        payload = json.loads(QUOTA_STATE.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return set()
+    if not isinstance(payload, dict):
+        return set()
+    blocked: set[str] = set()
+    changed = False
+    for model, expiry in list(payload.items()):
+        try:
+            valid = float(expiry) > now
+        except (TypeError, ValueError):
+            valid = False
+        if valid:
+            blocked.add(str(model))
+        else:
+            payload.pop(model, None)
+            changed = True
+    if changed:
+        _write_quota_state(payload)
+    return blocked
+
+
+def mark_quota_limited(model: str, *, now: float | None = None,
+                       ttl: float = 24 * 60 * 60) -> None:
+    """Remember a model-level quota response without storing credentials."""
+    model = (model or "").strip()
+    if not model:
+        return
+    now = time.time() if now is None else now
+    try:
+        payload = json.loads(QUOTA_STATE.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            payload = {}
+    except (OSError, ValueError, TypeError):
+        payload = {}
+    payload[model] = now + max(60.0, ttl)
+    _write_quota_state(payload)
+
+
+def _write_quota_state(payload: dict) -> None:
+    try:
+        QUOTA_STATE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = QUOTA_STATE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, QUOTA_STATE)
+        try:
+            os.chmod(QUOTA_STATE, 0o600)
+        except OSError:
+            pass
+    except OSError:
+        # Quota memory improves the next run but never masks the real API error.
+        pass
 
 
 def clear_cache() -> None:

@@ -61,12 +61,18 @@ from . import team as team_mod
 from .agent import Agent
 from .config import Config
 
-#: Briefs per wave. All of them run at once — see HUNT_CONCURRENCY.
-HUNT_WAVE_SIZE = 10
+#: Briefs per wave. Kept at the same size as the hard concurrency ceiling.
+HUNT_WAVE_SIZE = 5
 
-#: Workers in flight at any instant. Equal to the wave size by design: the
-#: operator asked for all ten to run simultaneously.
-HUNT_CONCURRENCY = 10
+#: Workers in flight at any instant. The hard ceiling also applies to explicit
+#: concurrency values passed by callers.
+HUNT_CONCURRENCY = 5
+
+# Recon and worker requests commonly outlive the interactive shell defaults.
+# Keep the override local to this campaign; ordinary Bash calls retain their
+# existing timeout and output limits.
+HUNT_BASH_TIMEOUT = 900
+HUNT_MAX_OUTPUT_CHARS = 80_000
 
 #: How long a turn's event stream may go quiet before the prose produced so far
 #: is flushed to the UI anyway. The planner's turn runs for tens of seconds over
@@ -108,8 +114,8 @@ _SLUG_RE = re.compile(r"[^a-zA-Z0-9._-]+")
 FINDING_CONTRACT = """\
 REPORTING
 ---------
-Report each confirmed vulnerability TWICE, and the first time is the one that
-matters:
+Report each well-supported candidate in the final JSON. Call the
+``report_finding`` tool only when the evidence meets the confirmation bar:
 
 1. THE MOMENT YOU CONFIRM IT — call the ``report_finding`` tool. Do this as soon
    as you have the evidence in hand, in the same turn you got it, before you go
@@ -118,10 +124,11 @@ matters:
    within a second. A finding you sit on until the end of your turn is a finding
    the operator spends that whole time not knowing about.
 
-   Report a bug you confirm even if you have not finished exploiting it — an
-   error that proves injection, a response that proves missing access control, a
-   banner that proves an old vulnerable version. Evidence of the weakness is
-   what counts, not a finished exploit.
+   A model-generated explanation, generic error, robots.txt entry, certificate
+   SAN, or vulnerable-version match is not confirmation. Require repeatable,
+   target-specific evidence that demonstrates the security property failed.
+   Prefer read-only evidence. Never access another user's private data or make
+   a production change to demonstrate impact.
 
 2. AGAIN IN YOUR FINAL MESSAGE — end it with ONE JSON object on its own lines,
    wrapped in a ```json fence:
@@ -139,13 +146,34 @@ Rules for both:
 - One entry per distinct bug, and the same bug is the same bug in both places.
   The two are reconciled by title and asset, so repeating yourself costs
   nothing; reporting the same bug under two different names inflates the count.
-- If you found nothing, call no tool and omit the block entirely (or send
-  `{"findings": []}`) — do not invent a finding to fill either one.
+- If you found nothing confirmed, call no tool. You may list a concrete,
+  unconfirmed lead in the narrative, clearly labelled as unverified; never
+  invent evidence or present a hypothesis as a finding. If there are no
+  candidates, omit the block entirely (or send `{"findings": []}`).
 - `severity` must be one of the five words above. Judge it honestly: a
   theoretical weakness with no demonstrated impact is `low`, not `critical`.
 - `evidence` must be something you actually observed, not something you expect.
   A finding with no evidence is a guess and will be discarded. ``report_finding``
   refuses a report with no evidence, which is deliberate.
+- Use only the declared host and explicitly in-scope paths. Do not follow
+  certificate SANs or discovered links to another host unless it was declared
+  in scope. No brute force, destructive payloads, state changes, private-data
+  access, secret retrieval, persistence, or denial-of-service tests. If impact
+  cannot be proven safely, label it unconfirmed in the final narrative.
+- Certificate SAN entries, DNS records, banners, and a WAF challenge are leads,
+  not vulnerabilities. Never label a hostname a WAF bypass from its SAN alone.
+  To confirm a WAF bypass, show that the same in-scope application path is
+  blocked through the protected entry point but reaches the application through
+  another explicitly authorized hostname, with the exact paired responses.
+  A hostname discovered in a certificate is not by itself authorization to
+  scan that host; it must be covered by the declared scope.
+- For every suspected issue, first reproduce the baseline, change one variable,
+  then compare the response. Recheck a positive signal once with a harmless
+  control request. State clearly what the evidence proves and what it does not;
+  never infer impact from a tool's label or a version match alone.
+- Demonstrate exploitability only with a minimal, reversible proof in the
+  authorized scope. Stop as soon as impact is established; do not chain into
+  broader access, read private records, or alter state to make a stronger demo.
 - Put nothing after the final JSON block. Anything you want to say, say before it.
 """
 
@@ -159,9 +187,10 @@ You are opening a security engagement against a declared, authorised target.
 
 TARGET: {target}
 
-This is the RECON phase. Map the target before anyone attacks it. Do not attempt
-exploitation here — that is the next phase, and a recon run that stops early to
-try a payload has failed at its actual job.
+This is the RECON phase. Build a concrete, evidence-backed map for the worker
+wave. Do not stop after saying the site is reachable: identify live routes,
+input points, and likely stack components using bounded, read-only checks.
+Record which checks actually ran and which did not.
 
 Work with the tools you have. Establish, as far as you can:
 
@@ -174,21 +203,36 @@ Work with the tools you have. Establish, as far as you can:
 - Hypotheses: the specific classes of bug this stack plausibly has, and which
   asset each would live on.
 - Tooling: which offensive tools are actually present on THIS host, and whether
-  a wordlist is available. Check for at least: nmap, ffuf, gobuster,
-  feroxbuster, nikto, sqlmap, nuclei, whatweb, wafw00f, testssl.sh, sslyze,
-  curl, dig, host, nslookup, openssl. Also check the usual wordlist roots
-  (/usr/share/wordlists, /usr/share/seclists/Discovery/Web-Content). One
-  `which` over the whole list, then `ls` on the wordlist roots — this is worth
-  a turn, because a brief that sends an agent after a binary that is not
-  installed wastes the agent entirely, and ten agents each re-checking for
-  themselves wastes the wave.
+  a wordlist is available. The exact local tool inventory is supplied below;
+  do not spend a turn checking it again. Choose only tools marked AVAILABLE.
+
+When a tool or wordlist is absent, do not stop the assessment and do not call
+that absence a target weakness. Use available low-impact alternatives: curl or
+Python's standard-library urllib for HTTP headers, robots.txt, sitemap.xml,
+and links on the supplied site; Python socket/getaddrinfo for DNS; and
+`openssl s_client` for a read-only TLS handshake. Use the browser/web tools if
+they are available. Keep a concise list of checks that could not be performed
+so the final report states the coverage gap honestly. Do not install packages
+or download wordlists during a target assessment.
+
+For an explicitly in-scope host, use nmap for a measured TCP service inventory
+(`-sT -sV --top-ports 1000 -T2 --max-retries 1`) only when nmap is installed.
+Otherwise record that the inventory was unavailable and use the read-only
+alternatives above. Do not run full-port sweeps, brute-force scripts, or
+vulnerability scripts during recon. Keep web discovery bounded and slow.
 
 Be concrete. A hypothesis that names a host and a parameter is worth ten that
 name a category. If the target does not answer at all, say so plainly and report
 what you tried — that is a real result, not a failure.
 
-Finish with a short written brief: what the target is, what you could reach,
-what you could not, and your ranked hypotheses for where the bugs are.
+For every claim include the source (command/request and relevant status, header,
+or path). Treat robots.txt, SANs, banners, and generic errors as leads only.
+Do not spend turns repeating the same request. If a check fails, try one
+available alternative and continue mapping other surfaces.
+
+Finish with a short written brief: what the target is, which concrete assets
+were observed, what was tested, what could not be tested, and ranked hypotheses
+that name a real route or input rather than only a generic bug class.
 
 {contract}
 """
@@ -217,6 +261,13 @@ but do not attempt the work itself. That is what the agents are for.
 
 Rules:
 - Return AT MOST {wave_size} workers. Fewer is better than padding.
+- Prefer {wave_size} distinct useful checks when the recon has that many
+  concrete assets or unanswered hypotheses. Do not return an empty list just
+  because the tools are imperfect or earlier calls failed; give the workers
+  alternative checks using curl, Python, or other tools that are present.
+- Return an empty `workers` list only when the recon and all completed waves
+  leave no meaningful in-scope checks or finding retests. That ends the campaign
+  early; do not request more work just to fill the wave budget.
 - Every brief must be INDEPENDENT: no agent may depend on another's output,
   because they all run at the same time and cannot talk to each other.
 - Do not repeat work already done. Read the findings and the wave history and
@@ -224,8 +275,12 @@ Rules:
   different endpoint of the same service, a second parameter, a bypass of the
   same control — that is the highest-value brief you can write.
 - If an earlier finding was marked low-confidence or a worker failed, a brief
-  that re-tests it properly is worth a slot.
-- Spread the wave across different bug classes. Ten briefs that all test
+  that re-tests it properly is worth a slot, with a different request or
+  command and a measurable expected observation.
+- When prior findings exist, reserve a worker to independently revalidate the
+  highest-impact one or safely demonstrate its impact. If nothing is confirmed,
+  use those slots for new endpoints and bug classes instead.
+- Spread the wave across different bug classes. Five briefs that all test
   injection waste nine slots. The classes worth covering, roughly in order of
   how often they pay: broken access control, authentication and session flaws,
   injection, business-logic abuse, sensitive-data exposure, misconfiguration,
@@ -245,6 +300,92 @@ Reply with ONE JSON object and nothing else:
                "owns": ["the asset or vector it owns"]}}]}}
 
 {contract}
+"""
+
+# The interactive `/bug-hunt` command makes up to eight adaptive passes over
+# one declared target. The bounded API default remains one wave for callers
+# that expect a single pass; AD keeps its stricter one-wave workflow.
+BUG_HUNT_MAX_WAVES = 8
+GEMINI_MODEL_FALLBACK_LIMIT = 8
+
+HUNT_WORKER_EXECUTION_NOTE = """\
+EXECUTION REQUIREMENTS
+----------------------
+This is an active worker in an already-running /bug-hunt. Execute the assigned
+checks with the available tools; do not answer with a proposed methodology or
+ask the operator to launch another command. Check the recon notes for tools
+already available, then use them against only the assigned in-scope asset. If a
+required binary or endpoint is absent, report that concrete blocker and continue
+with another available, relevant check; missing one tool is never a reason to
+end the assignment. Start from the concrete route, parameter, component, or
+response in recon. Make a small baseline request, change one relevant variable,
+and compare status, headers, and a short response excerpt. Avoid re-fetching the
+same URL without a reason. If the first probe is inconclusive, try a distinct
+safe check for the same hypothesis, then move to another concrete lead.
+
+TOOL CALLING
+------------
+Use the real tools exposed in this conversation through structured tool calls.
+Their names are `bash` (argument `command`) and `read_file` (argument `path`),
+plus any other tools explicitly shown in the tool list. Do not print XML such as
+`<tool_call>`, `<function=read>`, or `<parameter=path>`; those are plain text and
+will not execute. For a web target, do not inspect local project instructions
+such as AGENTS.md unless the operator specifically asks for repository analysis.
+Use `read_file` only for the supplied campaign notes or a file the task actually
+requires; use `bash` for installed command-line checks.
+
+For command-line checks, use bounded commands with explicit timeouts and output
+limits (for example curl --max-time, nmap -T2 with a narrow port set, or a
+small wordlist slice). Capture the command, exit status, and relevant output;
+do not claim a command ran if it was only proposed. Prefer installed tools and
+standard-library alternatives; never spend the assignment installing tools.
+Keep discovery rate low and sequential against the live host. A tool's label,
+robots.txt entry, SAN, banner, or version match is a lead, not proof. For a
+positive signal, make one harmless control comparison and report only the
+impact the observed evidence establishes. If safe proof needs authentication,
+state changes, another user's data, or unavailable test infrastructure, record
+the exact lead and the missing evidence, then continue with other checks.
+"""
+
+PENTEST_TOOL_INVENTORY_NOTE = """\
+{inventory}
+
+Tool selection notes:
+- nmap: a TCP service/version inventory of the single declared host only.
+- ffuf/gobuster/feroxbuster/dirsearch: GET-only path discovery, an existing
+  short wordlist, at most 2 requests/second, at most 2 workers, and a 90-second
+  cap. Stop immediately on 429, repeated 403, or target instability.
+- sqlmap: use only an observed parameter or an explicitly supplied test
+  request. Use --batch --smart --risk=1 --level=1 --technique=BEU --threads=1
+  --delay=1 --timeout=8 --retries=0. Never enumerate databases/tables, dump
+  rows, use stacked/time-based/out-of-band techniques, or access files/OS.
+- nuclei: only against the declared URL/host, with
+  DISABLE_NUCLEI_TEMPLATES_PUBLIC_DOWNLOAD=true, -disable-update-check,
+  -severity info,low,medium -rate-limit 2 -c 1 -bs 1 -timeout 8 -retries 0
+  -no-interactsh, and exclude dos,fuzz,bruteforce,intrusive tags. Use local
+  templates only; if none are installed, report the coverage gap.
+- whatweb/wafw00f/testssl.sh/sslyze/httpx: fingerprint or inspect the named
+  in-scope endpoint only. Subfinder/amass/dnsx results are leads; never scan a
+  discovered hostname unless it is independently declared in scope.
+
+If a suggested command's flags differ on the installed version, inspect its
+local `--help`, adapt once, and continue. The missing tool list is a coverage
+gap, not a reason to abandon the worker.
+"""
+
+FINDING_VALIDATION_NOTE = """\
+FINAL INDEPENDENT VALIDATION
+----------------------------
+The discovery phase is over. Independently recheck the candidate below using
+the least-invasive request that can confirm it. Do not trust the previous
+agent's conclusion as evidence. Require target-specific observable evidence;
+an assertion or a generic error is not enough. Do not read private records,
+change production state, use persistence, or run denial-of-service checks.
+Stop once impact is established. Finish with exactly these fields, putting
+one of the three status values after the colon:
+VALIDATION: <CONFIRMED|NOT_REPRODUCED|INCONCLUSIVE>
+EVIDENCE: exact request/command and observed response
+IMPACT: what this proves, or why it remains uncertain
 """
 
 #: Inserted into the planner prompt when the recon above was inherited from an
@@ -291,9 +432,11 @@ Write the report the operator will actually read. It must cover, in this order:
 1. **What was tested** — the ground covered, wave by wave, in plain language.
    Not a list of agent names; a description of the attack surface that was
    actually exercised.
-2. **What was found** — each confirmed finding, worst first, with its severity
-   and the evidence that proves it. Be precise about impact. If something was
-   reported by an agent but the evidence does not hold up, say so and say why.
+2. **What was found** — each finding, worst first, with severity, evidence, and
+   independent validation status (CONFIRMED, NOT_REPRODUCED, or INCONCLUSIVE).
+   Only call a bug confirmed when the independent recheck itself supplies
+   concrete target-specific proof. Present inconclusive results as unverified
+   leads, and explain when evidence does not hold up.
 3. **What is worth checking next** — the specific, still-open leads, each
    concrete enough that someone could pick it up and run with it.
 4. **What is not worth the time** — the avenues that were checked and are clean,
@@ -315,37 +458,77 @@ nothing real, the report says that and explains what was ruled out.
 
 HUNT_VECTORS: list[tuple[str, str, str]] = [
     (
+        "network-services",
+        "Network surface. Against only the named, explicitly in-scope host, use "
+        "nmap for a TCP service/version inventory "
+        "(`-sT -sV --top-ports 1000 -T2 --max-retries 1`) "
+        "if installed; otherwise use available read-only DNS, TLS, and HTTP "
+        "checks and record the missing inventory as a coverage gap. Never scan "
+        "SAN-discovered hosts unless they are separately in scope. A certificate "
+        "SAN is not evidence of a WAF bypass. Do not run vulnerability scripts "
+        "or brute force. Report exact commands, ports, and observed banners.",
+        "network services",
+    ),
+    (
         "access-control",
-        "Broken access control. Enumerate every endpoint and object reference you "
-        "can reach and test whether an unauthenticated or lower-privileged "
-        "request can reach it: IDOR on object ids, forced browsing to admin "
-        "paths, HTTP method tampering, missing function-level checks. Prove each "
-        "with the exact request and response.",
+        "Broken access control. Map public routes and authorization boundaries "
+        "with read-only requests. Test only public resources or a test account "
+        "explicitly provided for this engagement. Do not enumerate real IDs, "
+        "access another user's records, bypass authentication, or submit "
+        "state-changing methods. Record baseline and harmless control responses; "
+        "robots.txt entries and status codes alone are leads, not proof.",
         "access control",
     ),
     (
         "auth-session",
-        "Authentication and session handling. Probe login for user enumeration, "
-        "credential stuffing resistance, lockout, password-reset flow flaws and "
-        "token predictability. Inspect session cookies for missing HttpOnly / "
-        "Secure / SameSite, weak entropy, and whether logout actually invalidates "
-        "the session server-side.",
+        "Authentication and session handling. Compare unauthenticated response "
+        "shapes for user enumeration; inspect password-reset flow and session "
+        "cookie flags. Do not try passwords, real credentials, or lockout tests "
+        "against live accounts. Only use a dedicated test account if one was "
+        "explicitly supplied for this scope.",
         "authentication",
     ),
     (
         "injection",
         "Injection. Test every input you found — query parameters, form fields, "
-        "headers, cookies, JSON bodies — for SQL, NoSQL, command, template and "
-        "LDAP injection. Use safe, non-destructive probes first and escalate only "
-        "on a positive signal. Report the payload and the evidence of execution.",
+        "headers, cookies, JSON bodies — for injection. Use minimal read-only "
+        "probes with baseline/control comparison. If sqlmap is AVAILABLE and "
+        "there is a concrete observed parameter, run the bounded sqlmap profile "
+        "from the tool notes. Never enumerate databases/tables, dump data, use "
+        "stacked/time-based/out-of-band techniques, write data, access files/OS, "
+        "or retrieve secrets. A generic 500 is not proof; report exact paired "
+        "evidence and stop once a safe signal is established.",
         "injection",
+    ),
+    (
+        "web-content-discovery",
+        "Web content discovery. If ffuf, gobuster, feroxbuster, or dirsearch is "
+        "AVAILABLE and a local wordlist was detected, use one tool on the "
+        "declared origin only. Restrict to GET, 2 requests/second, 2 workers, "
+        "and 90 seconds; use a short common wordlist slice. Do not recurse, "
+        "submit forms, brute-force credentials, or follow links to other hosts. "
+        "Stop on 429, repeated 403, or instability. Record exact paths/statuses; "
+        "a discovered route is a lead, not a vulnerability.",
+        "web content discovery",
+    ),
+    (
+        "template-vulnerability-check",
+        "Template-based checks. If nuclei is AVAILABLE, run it only against the "
+        "declared URL/host with the bounded command in the tool notes. Use the "
+        "installed local templates only; no template update, fuzz/DoS/brute-force "
+        "tags, interactsh/OAST, or scans of discovered hosts. Recheck every hit "
+        "manually with one harmless request before reporting; template labels "
+        "and version matches are not proof on their own.",
+        "template checks",
     ),
     (
         "business-logic",
         "Business logic. Walk the application's real workflows and look for ways "
         "to abuse them: skipping steps, replaying a one-time action, negative or "
         "overflowing quantities, price or role tampering in a request body, "
-        "self-approval, and race windows in anything that should happen once.",
+        "self-approval, and race windows in anything that should happen once. "
+        "Never fire state-changing requests concurrently against production; "
+        "inspect code or use a designated test environment and disposable data.",
         "business logic",
     ),
     (
@@ -368,19 +551,21 @@ HUNT_VECTORS: list[tuple[str, str, str]] = [
     ),
     (
         "input-validation",
-        "Input validation and client-side trust. Test for reflected and stored "
-        "XSS, HTML injection, open redirects, SSRF via any URL-shaped parameter, "
-        "path traversal in file parameters, XXE in any XML endpoint, and "
-        "deserialization of attacker-controlled data.",
+        "Input validation and client-side trust. Inspect reflections and "
+        "redirect behavior with inert markers and read-only requests. Do not "
+        "submit persistent script payloads, trigger server-side fetches, access "
+        "local/private network addresses, read files, or send XXE/deserialization "
+        "payloads. Distinguish encoded text from executable browser context; "
+        "report a lead if safe browser proof is unavailable.",
         "input validation",
     ),
     (
         "race-conditions",
-        "Race conditions and state. Find operations that should be atomic — "
-        "coupon redemption, transfers, invites, rate limits, vote or like "
-        "counters — and fire them concurrently to test for double-spend, limit "
-        "bypass and inconsistent state. Report the timing evidence, not just the "
-        "outcome.",
+        "Race conditions and state. Review code, documentation, or read-only "
+        "behavior for operations that should be atomic. Do not issue concurrent "
+        "or repeated state-changing requests against production. Without a "
+        "disposable test environment and data explicitly provided for this "
+        "engagement, report a specific lead and evidence needed for reproduction.",
         "race conditions",
     ),
     (
@@ -400,6 +585,47 @@ HUNT_VECTORS: list[tuple[str, str, str]] = [
         "than reporting a bare version match.",
         "dependencies",
     ),
+    (
+        "api-authorization",
+        "API authorization and object access. Inventory REST and GraphQL routes, "
+        "then compare unauthenticated and authorized responses. Check object IDs, "
+        "tenant boundaries, mass assignment, and excessive response fields. Use "
+        "only public data or an explicitly supplied test account; do not enumerate "
+        "real users or retrieve private records.",
+        "API authorization",
+    ),
+    (
+        "ssrf-callbacks",
+        "Server-side request forgery. Review URL-fetching, webhook, import, and "
+        "preview parameters. Use a benign callback endpoint only if one is supplied "
+        "for this engagement; do not probe cloud metadata, localhost, or private "
+        "network services. Otherwise report a specific unconfirmed lead.",
+        "SSRF",
+    ),
+    (
+        "file-upload",
+        "File upload and path handling. Check extension and content-type validation, "
+        "size limits, storage exposure, and filename traversal using harmless "
+        "disposable content in an explicitly authorized test area. Do not upload "
+        "executable payloads or overwrite existing files.",
+        "file upload",
+    ),
+    (
+        "graphql-surface",
+        "GraphQL surface. If GraphQL is exposed, inspect schema/introspection policy, "
+        "authorization on fields and mutations, depth/alias limits, and error "
+        "disclosure using bounded read-only queries. Do not submit state-changing "
+        "mutations or resource-exhaustion queries.",
+        "GraphQL",
+    ),
+    (
+        "cache-and-cors",
+        "Browser boundary and caching. Check CORS credential handling, cache "
+        "headers on user-specific responses, host/header trust, and cross-origin "
+        "behavior with harmless requests. Do not access another user's account; "
+        "use only a supplied test account or public responses.",
+        "browser boundary",
+    ),
 ]
 
 
@@ -407,6 +633,12 @@ def fallback_roster(wave: int, wave_size: int = HUNT_WAVE_SIZE,
                     kind: "CampaignKind | None" = None) -> team_mod.Roster:
     """A fixed matrix roster, used when the planner's reply cannot be read."""
     vectors = (kind.vectors if kind is not None and kind.vectors else HUNT_VECTORS)
+    # Use disjoint fallback windows so an unreadable planner does not make the
+    # campaign repeat checks it already ran. The planner can still add
+    # target-specific checks in later waves when it returns a valid roster.
+    if kind is None:
+        start = max(0, (wave - 1) * wave_size)
+        vectors = vectors[start:start + wave_size]
     workers = [
         team_mod.WorkerSpec(name=name, brief=brief, owns=[owns])
         for name, brief, owns in vectors[:wave_size]
@@ -416,6 +648,92 @@ def fallback_roster(wave: int, wave_size: int = HUNT_WAVE_SIZE,
                 f"matrix for wave {wave}",
         workers=workers,
     )
+
+
+def _next_gemini_model(current: str, attempted: set[str],
+                       catalog_ids: list[str] | None = None) -> str | None:
+    """Choose a small, known-chat fallback set after a Gemini model quota.
+
+    Gemini's catalog does not expose free-tier eligibility, so prefer a
+    currently listed Flash model and try only a bounded number of candidates.
+    """
+    from . import gemini as gemini_mod
+
+    # Prefer a currently advertised Flash model; hard-coded names can retire
+    # while Google's catalog changes. Only use the familiar defaults when the
+    # authenticated catalog could not be read.
+    available = (catalog_ids if catalog_ids is not None
+                 else (gemini_mod.cached_ids() or []))
+    preferred = sorted(
+        dict.fromkeys(available),
+        key=lambda model: ("flash" not in model.lower(), available.index(model)),
+    )
+    if not preferred:
+        preferred = [gemini_mod.DEFAULT_MODEL, "gemini-flash-latest"]
+    for model in preferred:
+        model = (model or "").strip()
+        if model and model != current and model not in attempted:
+            return model
+    return None
+
+
+async def _gemini_catalog_ids(*, refresh: bool = False) -> list[str]:
+    """Use the authenticated Gemini chat catalog, refreshing it when requested."""
+    from . import gemini as gemini_mod
+
+    ids = gemini_mod.cached_ids() or []
+    if ids and not refresh:
+        return ids
+    credentials = gemini_mod.load_credentials()
+    if not credentials:
+        return ids
+    models, _ = await asyncio.to_thread(
+        gemini_mod.chat_models, credentials[0], use_cache=not refresh)
+    return [model.id for model in models or []]
+
+
+async def _switch_gemini_after_quota(
+    cfg: Config,
+    run: HuntRun,
+    attempted: set[str],
+    fallback_count: int,
+    on_event: Callable[[dict], Awaitable[None]],
+    *,
+    stage: str,
+) -> tuple[bool, int]:
+    """Select another catalog model after a Gemini quota and clear its breaker."""
+    if not run.stop_reason.startswith("gemini quota reached"):
+        return False, fallback_count
+    if fallback_count >= GEMINI_MODEL_FALLBACK_LIMIT:
+        run.stop_reason += (
+            f"; reached the {GEMINI_MODEL_FALLBACK_LIMIT}-model fallback limit; "
+            "switch provider or wait for quota reset"
+        )
+        return False, fallback_count
+
+    attempted.add(cfg.model)
+    catalog_ids = await _gemini_catalog_ids()
+    next_model = _next_gemini_model(cfg.model, attempted, catalog_ids)
+    if not next_model:
+        catalog_ids = await _gemini_catalog_ids(refresh=True)
+        next_model = _next_gemini_model(cfg.model, attempted, catalog_ids)
+    if not next_model:
+        run.stop_reason += "; no unused model in the Gemini chat catalog"
+        return False, fallback_count
+
+    previous_model = cfg.model
+    cfg.model = next_model
+    attempted.add(next_model)
+    run.stop_reason = ""
+    run.stop.clear()
+    await on_event({
+        "type": "hunt_model_fallback",
+        "provider": "Gemini",
+        "previous": previous_model,
+        "model": next_model,
+        "message": f"model quota reached during {stage}; continuing with catalog fallback",
+    })
+    return True, fallback_count + 1
 
 
 # ---------------------------------------------------------------------------
@@ -523,6 +841,9 @@ class Finding:
     summary: str = ""
     evidence: str = ""
     remediation: str = ""
+    validation: str = ""
+    validation_detail: str = ""
+    report_path: str = ""
     #: True for a finding earlier work confirmed and this run loaded to seed its
     #: tracker — a prior campaign's, or a prior wave's. Carried findings are
     #: shown and fed to the planner, but they are not this run's work: the
@@ -580,6 +901,7 @@ class HuntRun:
     target: str
     directory: Path
     stop: asyncio.Event = field(default_factory=asyncio.Event)
+    stop_reason: str = ""
     wave: int = 0
     #: Which doctrine produced this campaign — "hunt" or "ad". Read back from
     #: the plan frontmatter by ``load_run``, and defaulted to "hunt" for every
@@ -631,6 +953,8 @@ class HuntRun:
         for f in self.ranked():
             asset = f" @ {f.asset}" if f.asset else ""
             line = f"- [{f.severity}] {f.title}{asset} — {f.summary}".rstrip()
+            if f.validation:
+                line += f"  (independent validation: {f.validation})"
             if f.carried:
                 line += "  (found in an earlier wave)"
             lines.append(line)
@@ -785,18 +1109,22 @@ def _finding_markdown(run: HuntRun, f: Finding) -> str:
         f"agent: {f.agent}\n"
         f"severity: {f.severity}\n"
         f"asset: {f.asset}\n"
+        f"validation: {f.validation or 'pending'}\n"
         f"timestamp: {stamp}\n"
         "---\n\n"
         f"# {f.title}\n\n"
         f"**Severity:** {f.severity}  \n"
         f"**Asset:** {f.asset or '(not stated)'}  \n"
         f"**Found by:** {f.agent} (wave {f.wave})\n\n"
+        f"**Independent validation:** {f.validation or 'pending'}\n\n"
         "## Summary\n\n"
         f"{f.summary or '(no summary given)'}\n\n"
         "## Evidence\n\n"
         f"{f.evidence or '(no evidence recorded)'}\n\n"
         "## Remediation\n\n"
-        f"{f.remediation or '(no remediation suggested)'}\n"
+        f"{f.remediation or '(no remediation suggested)'}\n\n"
+        "## Validation evidence\n\n"
+        f"{f.validation_detail or '(pending independent validation)'}\n"
     )
 
 
@@ -1370,8 +1698,9 @@ def write_report(run: HuntRun, f: Finding) -> Path:
     the whole point of writing them.
     """
     base = wave_findings_dir(run.directory, f.wave) / f"{f.severity}-{_slug(f.title)}.md"
-    path = _unique(base)
+    path = Path(f.report_path) if f.report_path else _unique(base)
     path.write_text(_finding_markdown(run, f), encoding="utf-8")
+    f.report_path = str(path)
     return path
 
 
@@ -1490,6 +1819,8 @@ def build_evidence_report(run: HuntRun) -> str:
         # promise.
         f"**Waves:** {len(numbers)}  ",
         f"**Findings:** {len(ranked)} ({tally})",
+        "**Note:** A finding is confirmed only when its independent validation "
+        "status is CONFIRMED with concrete evidence; other statuses are leads.",
         "",
         "This report contains only what was recorded during the engagement. "
         "Evidence is reproduced as captured.",
@@ -1523,6 +1854,7 @@ def build_evidence_report(run: HuntRun) -> str:
                 "",
                 f"- **Asset:** {f.asset or '(not stated)'}",
                 f"- **Found by:** {f.agent} (wave {f.wave})",
+                f"- **Independent validation:** {f.validation or 'pending'}",
             ]
             if f.summary:
                 lines += ["", f.summary, ""]
@@ -1531,6 +1863,8 @@ def build_evidence_report(run: HuntRun) -> str:
             # trace, a dumped config, an injected `<script>` — renders as the
             # text it is rather than as markup in the operator's viewer.
             lines += ["```", (f.evidence or "(no evidence recorded)").strip(), "```", ""]
+            if f.validation_detail:
+                lines += ["**Validation evidence**", "", f.validation_detail, ""]
 
     return "\n".join(lines).rstrip() + "\n"
 
@@ -1651,7 +1985,10 @@ async def _run_agent(
     # has a tracker to report into; nothing outside a hunt does. can_hunt_read is
     # the other way round: this agent must not read the campaign it is part of,
     # because its brief is deliberately independent of the other agents'.
-    agent_cfg = dataclasses.replace(cfg)
+    agent_cfg = dataclasses.replace(
+        cfg, bash_timeout=max(cfg.bash_timeout, HUNT_BASH_TIMEOUT),
+        max_output_chars=max(cfg.max_output_chars, HUNT_MAX_OUTPUT_CHARS),
+    )
     worker = agent_factory(agent_cfg, tool_hook=tool_hook, can_report=True,
                            can_hunt_read=False)
 
@@ -1659,6 +1996,8 @@ async def _run_agent(
                     "brief": spec.brief})
 
     buf: list[str] = []
+    emitted_text: list[str] = []
+    actual_tool_calls = 0
 
     async def flush() -> None:
         text = "".join(buf).strip()
@@ -1669,16 +2008,21 @@ async def _run_agent(
     # Order matters: the shared context first, then the brief, then the contract
     # last — the reporting block is what the agent should be holding in mind as
     # it writes its final message.
-    prompt = f"{context}\n\n{spec.brief}" if context else spec.brief
+    task_brief = f"{HUNT_WORKER_EXECUTION_NOTE}\n\n{spec.brief}"
+    prompt = f"{context}\n\n{task_brief}" if context else task_brief
     if contract:
         prompt = f"{prompt}\n\n{contract}"
 
-    try:
-        async for ev in worker.run_turn(prompt):
+    async def consume_turn(turn_prompt: str) -> None:
+        nonlocal actual_tool_calls
+        async for ev in worker.run_turn(turn_prompt):
             etype = ev.get("type")
             if etype == "text_delta":
-                buf.append(ev.get("text", ""))
+                chunk = ev.get("text", "")
+                buf.append(chunk)
+                emitted_text.append(chunk)
             elif etype == "tool_call":
+                actual_tool_calls += 1
                 # Flush first, so the agent's reasoning lands above the call it
                 # explains rather than after it.
                 await flush()
@@ -1723,7 +2067,44 @@ async def _run_agent(
                 result.ok = False
                 result.error = ev.get("message", "") or "error"
                 await flush()
+                if run is not None:
+                    provider, reason, remember_model = _provider_stop_reason(
+                        cfg, result.error)
+                    if reason:
+                        run.stop_reason = reason
+                        if remember_model:
+                            try:
+                                from . import gemini as gemini_mod
+                                gemini_mod.mark_quota_limited(cfg.model)
+                            except Exception:  # noqa: BLE001 - error handling must not mask the original
+                                pass
+                        run.stop.set()
+
+    try:
+        await consume_turn(prompt)
         await flush()
+        # Some OpenAI-compatible routes print a different agent's XML tool
+        # protocol as prose. It has not called anything, so give the model one
+        # explicit chance to use the structured tools actually advertised here.
+        pseudo_tool_call = re.search(
+            r"(?:<tool_call\b|<function\s*=|<parameter\s*=|&lt;tool_call)",
+            "".join(emitted_text), re.IGNORECASE,
+        )
+        if pseudo_tool_call and actual_tool_calls == 0 and not result.error:
+            await on_event({
+                "type": "hunt_agent_text", "name": spec.name,
+                "text": "The previous reply used non-executable tool markup; "
+                        "retrying once with the available tools.",
+            })
+            await consume_turn(
+                "Your previous reply printed pseudo tool markup as text; it did "
+                "not run. Now perform the assigned checks using actual "
+                "structured tool calls from this conversation. Available names "
+                "include bash(command) and read_file(path). Do not print XML "
+                "tool syntax. If a tool fails, use a relevant available "
+                "alternative and continue the assignment.\n\n" + task_brief
+            )
+            await flush()
     except asyncio.CancelledError:
         # Never swallow cancellation — /stop-hunt has to unwind the whole wave.
         raise
@@ -1734,6 +2115,60 @@ async def _run_agent(
 
     result.digest = team_mod._digest(worker, result)
     return result
+
+
+def _provider_stop_reason(cfg: Config, error: str) -> tuple[str, str, bool]:
+    """Classify terminal model/API failures so every worker shares one circuit breaker.
+
+    Returns ``(provider, reason, remember_gemini_model_quota)``. Tool errors do
+    not pass through this path and therefore remain local to their worker.
+    """
+    text = (error or "").lower()
+    try:
+        from . import sources as sources_mod
+        provider = sources_mod.active_key(cfg.base_url) or "AI provider"
+    except Exception:  # noqa: BLE001 - classification must not mask the original
+        provider = "AI provider"
+    is_gemini = provider == "gemini" or text.startswith("gemini:")
+
+    if any(marker in text for marker in (
+        "rate limited (429)", "rate limit reached", "quota exceeded",
+        "not offered on the free tier", "quota limit: 0",
+    )) or ("429" in text and ("rate" in text or "quota" in text)):
+        if is_gemini:
+            return (
+                "gemini",
+                "gemini quota reached or model unavailable; paused to avoid "
+                "repeating rejected calls",
+                True,
+            )
+        return (provider, f"{provider} quota/rate limit reached; campaign paused", False)
+
+    if any(marker in text for marker in (
+        "authentication failed", "authenticationerror", "401 unauthorized",
+        "invalid api key", "incorrect api key", "unauthorized", "key rejected",
+    )):
+        return (provider, f"{provider} authentication failed; campaign stopped", False)
+
+    if any(marker in text for marker in (
+        "cannot connect to", "cannot reach", "apiconnectionerror",
+        "connection refused", "name or service not known", "temporary failure in name resolution",
+        "endpoint accepted the request then sent nothing",
+    )):
+        return (provider, f"{provider} API connection failed after retries; campaign paused", False)
+
+    if any(marker in text for marker in (
+        "model or endpoint not found (404)", "endpoint rejected the model name",
+    )):
+        return (provider, f"{provider} rejected the model/endpoint (404); campaign stopped", False)
+
+    if any(marker in text for marker in (
+        "server error (500)", "server error (502)", "server error (503)",
+        "server error (504)", "internal server error",
+    )):
+        return (provider, f"{provider} server error persisted after retries; campaign paused", False)
+
+    return (provider, "", False)
 
 
 def _chain_hooks(*hooks):
@@ -1791,7 +2226,18 @@ async def _run_wave(
     parallel agents each get their own budget and the whole wave sprays ten
     times what the operator authorised.
     """
-    sem = asyncio.Semaphore(max(1, concurrency))
+    effective_concurrency = min(5, max(1, concurrency))
+    try:
+        from . import sources as sources_mod
+        if sources_mod.active_key(cfg.base_url) == "gemini":
+            # Gemini's per-model free-tier RPM is shared by every worker on
+            # this key. Launching ten agents at once makes them race that one
+            # quota and all report the same 429; serialize this provider's
+            # wave so each worker can finish before the next request starts.
+            effective_concurrency = 1
+    except Exception:  # noqa: BLE001 - concurrency fallback must not stop a hunt
+        pass
+    sem = asyncio.Semaphore(effective_concurrency)
     hook = _chain_hooks(interlock, team_mod._write_lock_hook(asyncio.Lock()))
 
     async def _one(index: int, spec: team_mod.WorkerSpec):
@@ -1953,8 +2399,21 @@ async def _collect_text_live(
                 "blocked": True,
             })
         elif etype == "error":
+            error = ev.get("message", "") or "unknown provider error"
             await on_event({"type": f"hunt_{prefix}_text",
-                            "text": f"({prefix} error: {ev.get('message', '')})"})
+                            "text": f"({prefix} error: {error})"})
+            if run is not None:
+                _, reason, remember_model = _provider_stop_reason(
+                    agent.cfg, error)
+                if reason:
+                    run.stop_reason = reason
+                    if remember_model:
+                        try:
+                            from . import gemini as gemini_mod
+                            gemini_mod.mark_quota_limited(agent.cfg.model)
+                        except Exception:  # noqa: BLE001
+                            pass
+                    run.stop.set()
     await flush()
     return "".join(parts)
 
@@ -1980,15 +2439,10 @@ async def run_hunt(
     Every step is reported through ``on_event`` as it happens. The caller owns
     the final summary text — this returns the run it needs to write it.
 
-    **It stops on its own now.** This used to be ``while not run.stop.is_set()``
-    with no cap at all, so a campaign ran wave after wave until the operator
-    pressed Ctrl+X — including waves planned after one that had already found a
-    critical, which is work the operator did not ask for and could not decline.
-    The loop is bounded by ``max_waves`` (default 1) and the UI never raises it,
-    so the command runs one wave per invocation and the operator decides whether
-    there is a next one. The bound is a parameter rather than a bare ``break``
-    so a test can still drive two waves through one call and check that the
-    second planner saw the first wave's findings.
+    The loop is bounded by ``max_waves`` (default 1); the interactive
+    `/bug-hunt` command opts into several adaptive waves. Each wave receives the
+    previous findings and failures, and an empty plan ends coverage early. A
+    provider error or `/stop-hunt` still cancels the campaign immediately.
 
     ``wave_number`` names the wave to run; ``None`` means the next one the scope
     has not run yet — see ``next_wave_number``. So ``/bug-hunt host`` continues a
@@ -2016,6 +2470,13 @@ async def run_hunt(
     is unaffected. `/ad` passes its own.
     """
     kind = kind or HUNT_KIND
+    if kind.command == "bug-hunt":
+        from . import pentest as pentest_mod
+        pentest_inventory = pentest_mod.render_inventory()
+        pentest_note = PENTEST_TOOL_INVENTORY_NOTE.format(
+            inventory=pentest_inventory)
+    else:
+        pentest_note = ""
     if run is None:
         run = HuntRun(target=target, directory=case_dir(cfg, target, kind))
     if stop is not None:
@@ -2052,6 +2513,51 @@ async def run_hunt(
         })
         return run
 
+    gemini_models_tried: set[str] = set()
+    gemini_fallbacks = 0
+    try:
+        from . import sources as sources_mod
+        active_provider = sources_mod.active_key(cfg.base_url)
+    except Exception:  # noqa: BLE001 - provider detection must not block a hunt
+        active_provider = None
+    if active_provider == "gemini":
+        from . import gemini as gemini_mod
+        gemini_models_tried = gemini_mod.quota_limited_models()
+        if cfg.model in gemini_models_tried:
+            gemini_models_tried.add(cfg.model)
+            catalog_ids = await _gemini_catalog_ids()
+            next_model = _next_gemini_model(
+                cfg.model, gemini_models_tried, catalog_ids)
+            if not next_model:
+                catalog_ids = await _gemini_catalog_ids(refresh=True)
+                next_model = _next_gemini_model(
+                    cfg.model, gemini_models_tried, catalog_ids)
+            if next_model:
+                previous_model = cfg.model
+                cfg.model = next_model
+                gemini_models_tried.add(next_model)
+                gemini_fallbacks += 1
+                await on_event({
+                    "type": "hunt_model_fallback",
+                    "provider": "Gemini",
+                    "previous": previous_model,
+                    "model": next_model,
+                    "message": "previous model is still quota-limited; skipping it",
+                })
+            else:
+                run.stop_reason = (
+                    "all Gemini models in the current chat catalog were quota-limited "
+                    "in the last 24 hours; wait for quota reset or switch provider"
+                )
+                run.stop.set()
+                await on_event({
+                    "type": "hunt_end", "wave": run.wave,
+                    "findings": 0, "saved": 0, "carried": len(run.findings),
+                    "stop_reason": run.stop_reason,
+                    "directory": str(run.directory), "command": kind.command,
+                })
+                return run
+
     # ---- recon, or the recon we already have.
     #
     # The campaign directory is the scope's and is reused, so a second
@@ -2079,12 +2585,17 @@ async def run_hunt(
         # AS-REP roast happens, so it is exactly the phase that must not be
         # allowed to spray — an unthrottled recon turn is the one place a
         # campaign could lock out a domain before a single brief was written.
-        recon_agent = agent_factory(dataclasses.replace(cfg), can_report=True,
+        recon_cfg = dataclasses.replace(
+            cfg, bash_timeout=max(cfg.bash_timeout, HUNT_BASH_TIMEOUT),
+            max_output_chars=max(cfg.max_output_chars, HUNT_MAX_OUTPUT_CHARS),
+        )
+        recon_agent = agent_factory(recon_cfg, can_report=True,
                                     can_hunt_read=False,
                                     tool_hook=kind.interlock)
         run.recon = await _collect_text_live(
             recon_agent,
-            kind.recon_prompt.format(target=target, contract=kind.contract),
+            pentest_note + "\n\n" + kind.recon_prompt.format(
+                target=target, contract=kind.contract),
             on_event, run=run,
         )
         # Written before the event, so the path can ride on it: the UI has the
@@ -2136,6 +2647,12 @@ async def run_hunt(
     # ---- waves. Bounded, and still racing the operator's stop: `/stop-hunt`
     # mid-wave unwinds the agents rather than waiting out the slowest one.
     waves_run = 0
+    gemini_models_tried.add(cfg.model)
+    if run.stop.is_set():
+        switched, gemini_fallbacks = await _switch_gemini_after_quota(
+            cfg, run, gemini_models_tried, gemini_fallbacks, on_event,
+            stage="recon",
+        )
     while not run.stop.is_set() and waves_run < max(1, max_waves):
         waves_run += 1
         run.wave += 1
@@ -2148,12 +2665,11 @@ async def run_hunt(
         # the recon and the findings in its prompt, so it must not also read the
         # campaign directory: that would put the raw artefacts in front of it
         # alongside the digest, which is the same information twice.
-        planner = agent_factory(dataclasses.replace(cfg, mode="plan"),
-                                can_hunt_read=False, tool_hook=kind.interlock)
         plan_prompt = kind.planner_prompt.format(
             target=target,
             wave_size=wave_size,
-            recon=run.recon or "(recon produced nothing)",
+            recon=(run.recon or "(recon produced nothing)")
+                  + "\n\n" + pentest_note,
             recon_note=(
                 RECON_INHERITED_NOTE.format(
                     age_days=int((run.recon_age or 0) // 86400))
@@ -2169,24 +2685,44 @@ async def run_hunt(
         # nothing, so the operator watched a blank screen while the briefs were
         # written. The events go out as `hunt_plan_*` and the wave view feeds
         # them to the planning feed.
-        plan_text = await _collect_text_live(planner, plan_prompt, on_event,
-                                             prefix="plan")
-        roster = team_mod.parse_roster(plan_text, max_agents=wave_size)
+        while True:
+            planner = agent_factory(dataclasses.replace(cfg, mode="plan"),
+                                    can_hunt_read=False, tool_hook=kind.interlock)
+            plan_text = await _collect_text_live(
+                planner, plan_prompt, on_event, run=run, prefix="plan")
+            roster = team_mod.parse_roster(plan_text, max_agents=wave_size)
 
-        # One retry before giving up on the planner. A model that answered in
-        # prose or wrapped the object in a fence it malformed usually gets it
-        # right when told plainly what was wrong, and a real roster is worth
-        # far more than the fixed matrix. Streamed too, so a retry is not a
-        # second unexplained silence.
-        if roster is None or not roster.workers:
-            retry_text = await _collect_text_live(
-                planner, plan_prompt + "\n\n" + PLANNER_RETRY_NUDGE, on_event,
-                prefix="plan")
-            if retry_text.strip():
-                plan_text = retry_text
-                roster = team_mod.parse_roster(retry_text, max_agents=wave_size)
+            if run.stop.is_set():
+                switched, gemini_fallbacks = await _switch_gemini_after_quota(
+                    cfg, run, gemini_models_tried, gemini_fallbacks, on_event,
+                    stage="wave planning",
+                )
+                if switched:
+                    continue
+                break
 
-        fell_back = roster is None or not roster.workers
+            # One retry before giving up on an unreadable planner reply.
+            if roster is None or not roster.workers:
+                retry_text = await _collect_text_live(
+                    planner, plan_prompt + "\n\n" + PLANNER_RETRY_NUDGE,
+                    on_event, run=run, prefix="plan")
+                if run.stop.is_set():
+                    switched, gemini_fallbacks = await _switch_gemini_after_quota(
+                        cfg, run, gemini_models_tried, gemini_fallbacks, on_event,
+                        stage="planner retry",
+                    )
+                    if switched:
+                        continue
+                    break
+                if retry_text.strip():
+                    plan_text = retry_text
+                    roster = team_mod.parse_roster(retry_text, max_agents=wave_size)
+            break
+
+        if run.stop.is_set():
+            break
+
+        fell_back = roster is None
         if fell_back:
             roster = fallback_roster(wave, wave_size, kind)
 
@@ -2207,6 +2743,13 @@ async def run_hunt(
                         for w in roster.workers],
         })
 
+        if not roster.workers:
+            await on_event({
+                "type": "hunt_plan_complete", "wave": wave,
+                "message": roster.summary or "no further in-scope checks were planned",
+            })
+            break
+
         if run.stop.is_set():
             break
 
@@ -2220,7 +2763,7 @@ async def run_hunt(
             roster.workers, cfg,
             on_event=on_event, agent_factory=agent_factory,
             stop=run.stop, concurrency=concurrency,
-            context=brief_context(run),
+            context=brief_context(run) + "\n\n" + pentest_note,
             contract=kind.contract,
             wave=wave, run=run,
             interlock=kind.interlock,
@@ -2280,6 +2823,19 @@ async def run_hunt(
             "fell_back": fell_back,
         })
 
+        # A worker can be the first request to hit a model's quota. Reuse the
+        # same fallback path as recon and planning so every stage behaves alike.
+        if run.stop_reason.startswith("gemini quota reached"):
+            switched, gemini_fallbacks = await _switch_gemini_after_quota(
+                cfg, run, gemini_models_tried, gemini_fallbacks, on_event,
+                stage="agent wave",
+            )
+            if not switched and "wait for quota reset" not in run.stop_reason:
+                run.stop_reason += (
+                    f"; tried {len(gemini_models_tried)} models; "
+                    "switch provider with /coli or wait for quota reset"
+                )
+
         # ---- the queued summary, run here: between waves nothing else is
         # streaming, so it cannot corrupt the transcript.
         if summary_flag is not None and summary_flag():
@@ -2288,6 +2844,81 @@ async def run_hunt(
             path = write_summary(cfg, run, text)
             await on_event({"type": "hunt_summary_done", "path": str(path),
                             "text": text, "wave": wave})
+
+    # Discovery is not the final word. Revisit each finding produced by this
+    # campaign with a separate worker, so the report distinguishes a reproduced
+    # issue from a plausible but unverified lead. The pass is skipped after an
+    # explicit stop or provider failure, and still obeys the five-worker ceiling.
+    candidates = [f for f in run.ranked() if not f.carried]
+    if candidates and not run.stop.is_set():
+        await on_event({"type": "hunt_validation_start", "count": len(candidates)})
+        for batch_start in range(0, len(candidates), min(5, max(1, wave_size))):
+            if run.stop.is_set():
+                break
+            batch = candidates[batch_start:batch_start + min(5, max(1, wave_size))]
+            specs = []
+            for offset, finding in enumerate(batch, start=batch_start + 1):
+                brief = (
+                    f"{FINDING_VALIDATION_NOTE}\n\nCANDIDATE #{offset}\n"
+                    f"Title: {finding.title}\nSeverity claimed: {finding.severity}\n"
+                    f"Asset: {finding.asset}\nClaim: {finding.summary}\n"
+                    "Independently test the claim from scratch against the declared "
+                    "asset. Do not use or repeat the discovery agent's evidence; "
+                    "collect a fresh request/response and, where safe, a benign "
+                    "control comparison. If you cannot reproduce it safely, say so; "
+                    "do not repeat the earlier claim as a fact."
+                )
+                specs.append(team_mod.WorkerSpec(
+                    name=f"verify-{offset}", brief=brief,
+                    owns=[finding.asset or finding.title],
+                ))
+            results = await _run_wave(
+                specs, cfg, on_event=on_event, agent_factory=agent_factory,
+                stop=run.stop, concurrency=concurrency,
+                # Do not feed the verifier the campaign digest: it contains the
+                # original finding and evidence, which can anchor the supposedly
+                # independent recheck. The verifier gets only its candidate brief.
+                context="", contract="", wave=run.wave,
+                run=run, interlock=kind.interlock,
+            )
+            for result in results:
+                import re
+                match = re.search(
+                    r"VALIDATION:\s*(CONFIRMED|NOT_REPRODUCED|INCONCLUSIVE)",
+                    result.digest, re.IGNORECASE,
+                )
+                status = match.group(1).upper() if match else "INCONCLUSIVE"
+                evidence_match = re.search(
+                    r"EVIDENCE:\s*(.+?)(?=\n(?:IMPACT:|VALIDATION:)|\Z)",
+                    result.digest, re.IGNORECASE | re.DOTALL,
+                )
+                validation_evidence = (evidence_match.group(1).strip()
+                                       if evidence_match else "")
+                # A model may emit the word CONFIRMED without supplying proof.
+                # Keep the raw digest for audit, but downgrade the structured
+                # status unless it includes a concrete evidence field.
+                if status == "CONFIRMED" and (
+                        not result.ok or not validation_evidence
+                        or validation_evidence.lower() in {
+                            "none", "n/a", "no evidence", "inconclusive", "unknown"
+                        }):
+                    status = "INCONCLUSIVE"
+                try:
+                    candidate_index = int(result.spec.name.rsplit("-", 1)[1]) - 1
+                    finding = candidates[candidate_index]
+                except (ValueError, IndexError):
+                    finding = None
+                if finding is not None:
+                    finding.validation = status
+                    finding.validation_detail = result.digest
+                    _save(run, finding)
+                await on_event({
+                    "type": "hunt_validation_done",
+                    "name": result.spec.name,
+                    "status": status,
+                    "digest": result.digest,
+                    "ok": result.ok,
+                })
 
     # The tracker holds carried findings too, so the closing counts are split:
     # `findings`/`saved` are what *this* campaign did, and `carried` is what it
@@ -2300,6 +2931,7 @@ async def run_hunt(
         "findings": len(own),
         "saved": sum(1 for f in own if f.saved),
         "carried": len(run.findings) - len(own),
+        "stop_reason": run.stop_reason,
         "directory": str(run.directory),
         # Which command ran it, so the UI's notice to the main agent names the
         # campaign that actually happened rather than assuming `/bug-hunt`.
@@ -2314,6 +2946,8 @@ def _finding_dict(f: Finding) -> dict:
         "wave": f.wave, "agent": f.agent, "title": f.title,
         "severity": f.severity, "asset": f.asset, "summary": f.summary,
         "evidence": f.evidence, "remediation": f.remediation,
+        "validation": f.validation,
+        "validation_detail": f.validation_detail,
     }
 
 
@@ -2346,6 +2980,8 @@ def summary_prompt(run: HuntRun, kind: "CampaignKind | None" = None) -> str:
                 f"### [{f.severity}] {f.title}\n"
                 f"asset: {f.asset or '(not stated)'}\n"
                 f"found by: {f.agent} (wave {f.wave})\n\n"
+                f"independent validation: {f.validation or 'pending'}\n"
+                f"validation evidence: {f.validation_detail or '(pending)'}\n\n"
                 f"{f.summary or '(no summary)'}\n\n"
                 f"evidence: {f.evidence or '(none recorded)'}\n\n"
                 f"suggested fix: {f.remediation or '(none)'}"
@@ -2460,6 +3096,9 @@ def load_run(directory: Path) -> HuntRun | None:
             summary=_section(text, "Summary"),
             evidence=_section(text, "Evidence"),
             remediation=_section(text, "Remediation"),
+            validation=meta.get("validation", ""),
+            validation_detail=_section(text, "Validation evidence"),
+            report_path=str(path),
         ))
 
     # Recon comes back too, from the newest notes file. Without this a summary

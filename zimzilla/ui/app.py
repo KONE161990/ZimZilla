@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import difflib
+import re
 import shutil
 import textwrap
 import threading
@@ -932,6 +933,7 @@ HELP_GROUPS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         ("/zim-inferbase", "switch upstream to Inferbase (direct, free price band)"),
         ("/zim-flex", "switch upstream to the Flex playground (direct, no key, chat only)"),
         ("/zim-gemini", "switch upstream to Google Gemini (direct, free AI Studio tier)"),
+        ("/coli", "switch to Colibri running on Windows"),
         ("/zim-antseed", "switch upstream to AntSeed (local buyer, free peers)"),
         ("/protocol [auto|anthropic|openai]", "which wire protocol the endpoint speaks"),
         ("/openai-endpoint <url> [model]", "talk Chat Completions to any OpenAI-compatible endpoint"),
@@ -1010,7 +1012,7 @@ HELP_GROUPS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         ("/scope-validator", "paste a programme overview → scope files + ranked targets"),
     ]),
     ("hunts", "HUNTS & REPORTING", "multi-agent campaigns and their output", [
-        ("/bug-hunt <target>", "recon, then one wave of 10 agents"),
+        ("/bug-hunt <target>", "up to 3 adaptive waves; pasted in-scope URL/IP also starts it"),
         ("/zimsuite <target>", "proxy workbench — history, repeater, intruder, crawl"),
         ("/bug-hunt <target> --wave N", "run wave N specifically"),
         ("/stop-hunt", "end a running hunt (works while busy)"),
@@ -1737,8 +1739,86 @@ class ZimZillaApp(App):
             return
         if text.startswith("/"):
             self._handle_command(text)
+        elif self._maybe_auto_hunt_target(text):
+            return
         else:
             self._run_turn(self._expand_at_refs(text))
+
+    def _maybe_auto_hunt_target(self, text: str) -> bool:
+        """Start a vulnerability hunt for a bare URL/IP explicitly in scope.
+
+        A URL by itself is an unambiguous request in this CLI. Requiring the
+        host to be in allow.yaml keeps that shorthand from turning an arbitrary
+        pasted address into an active scan.
+        """
+        import ipaddress
+        import re
+        from urllib.parse import urlsplit
+
+        candidate = text.strip().strip("`<>\"'")
+        if not candidate or any(ch.isspace() for ch in candidate):
+            return False
+
+        # Accept an explicit web URL, or an IP literal. A bare word such as
+        # "salut" is ordinary chat, not a hostname to scan. A bare DNS name
+        # is likewise ambiguous, so require the URL scheme for domain targets.
+        explicit_url = candidate.lower().startswith(("http://", "https://"))
+        if explicit_url:
+            if "://" not in candidate:
+                return False
+        else:
+            try:
+                addr = ipaddress.ip_address(candidate.strip("[]"))
+                host_text = f"[{addr}]" if addr.version == 6 else str(addr)
+            except ValueError:
+                return False
+            candidate = "https://" + host_text
+
+        try:
+            parsed = urlsplit(candidate)
+            host = parsed.hostname
+            _ = parsed.port  # reject malformed/out-of-range ports
+        except ValueError:
+            return False
+        if (parsed.scheme.lower() not in ("http", "https") or not host
+                or parsed.username or parsed.password or parsed.fragment):
+            return False
+
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            if not explicit_url:
+                return False
+            # Validate the DNS host only for an explicitly supplied URL.
+            labels = host.rstrip(".").split(".")
+            valid_labels = all(
+                0 < len(label) <= 63 and re.fullmatch(
+                    r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?", label)
+                for label in labels
+            )
+            if len(host) > 253 or not valid_labels:
+                return False
+
+        allowed, reason = self.agent.scope.in_allow(host)
+        if not allowed:
+            self._sys_line(
+                f"automatic vulnerability scan not started — add {host} to "
+                f"allow.yaml first ({reason})",
+                warn=True,
+            )
+            return True
+        denied, reason = self.agent.scope.deny.contains(host)
+        if denied:
+            self._sys_line(
+                f"automatic vulnerability scan blocked — {host} is excluded ({reason})",
+                warn=True,
+            )
+            return True
+
+        self._sys_line(f"authorized target recognized — starting /bug-hunt {candidate}",
+                       ok=True)
+        self._cmd_bug_hunt([candidate])
+        return True
 
     def _expand_at_refs(self, text: str) -> str:
         """Turn ``@path`` mentions into an attached-files block for the model.
@@ -2056,6 +2136,8 @@ class ZimZillaApp(App):
         if self.busy:
             self._sys_line("harness is busy — Ctrl+C to interrupt", warn=True)
             return
+        if self._maybe_auto_hunt_target(text):
+            return
         self._run_turn(self._expand_at_refs(text))
 
     # ---- turn worker ------------------------------------------------------
@@ -2087,6 +2169,7 @@ class ZimZillaApp(App):
         self._usage_source = sources_mod.active_key(self.cfg.base_url) or "custom"
         if self.memory.learn(text, source="conversation"):
             self.agent.memory_note = self.memory.prompt_note()
+            self.agent._invalidate_system_prompt()
         self._discord.set_activity("Thinking", self.cfg.display_model)
         self._set_rain(False)  # keep the transcript readable during a turn
 
@@ -2105,10 +2188,16 @@ class ZimZillaApp(App):
         # typed, not the briefing behind it.
         chat.write_block(R.turn_marker(self.agent.turn_count + 1, p))
         chat.write_block(R.user_prompt_block(display or text, p))
+        is_colibri = self._usage_source == "coli"
+        if is_colibri:
+            chat.set_spinner(f"Colibri prépare sa réponse · {self.cfg.display_model}")
         bar.set_activity("thinking", busy=True)
         spinner = asyncio.create_task(self._verb_spinner())
 
         try:
+            # Let Textual paint the user's message and Colibri status before
+            # synchronous prompt preparation and the network request begin.
+            await asyncio.sleep(0)
             async for ev in self.agent.run_turn(
                     text, deliverable=deliverable, image_paths=image_paths):
                 if self._cancelled:
@@ -2121,6 +2210,7 @@ class ZimZillaApp(App):
         finally:
             self.busy = False
             spinner.cancel()
+            chat.clear_spinner()
             chat.clear_stream()
             # Before card_finish and the buffer reset: a turn can end on
             # reasoning that never got an answer after it — an interrupted
@@ -2185,6 +2275,7 @@ class ZimZillaApp(App):
                 loop.set_counters(self.agent.turn_count, bar.iterations)
 
         elif etype == "reasoning_delta":
+            chat.clear_spinner()
             # The model's own thinking, streamed before it answers. Only some
             # endpoints send this — see `_stream_once` in agent.py for which,
             # and why an endpoint that drops it changes nothing here.
@@ -2193,6 +2284,7 @@ class ZimZillaApp(App):
                 chat.set_reasoning(self._reason_buf)
 
         elif etype == "text_delta":
+            chat.clear_spinner()
             # The first character of the answer means the thinking that
             # produced it is finished, so commit it now. Doing it here rather
             # than at turn_end is what keeps the transcript in the order the
@@ -2205,11 +2297,12 @@ class ZimZillaApp(App):
 
         elif etype == "retry":
             self._flush_stream(chat, p)
-            self._sys_line(
-                f"transport error ({ev['reason']}) — retry {ev['attempt']}/{ev['max']} "
-                f"in {ev['delay']:.1f}s",
-                warn=True,
-            )
+            if self._usage_source != "coli":
+                self._sys_line(
+                    f"transport error ({ev['reason']}) — retry {ev['attempt']}/{ev['max']} "
+                    f"in {ev['delay']:.1f}s",
+                    warn=True,
+                )
             bar.set_activity(f"retry {ev['attempt']}/{ev['max']}", busy=True)
 
         elif etype == "thinking_adaptive":
@@ -2503,9 +2596,9 @@ class ZimZillaApp(App):
     # ---- voice ------------------------------------------------------------
     def _voice_welcome(self) -> None:
         """The launch greeting, visual and spoken."""
-        self._sys_line("◈ hello sir — ZimZilla online. What are we building?",
+        self._sys_line("◈ Bonjour — ZimZilla est prêt. Que veux-tu faire ?",
                        ok=True)
-        self._voice.say("Hello sir. ZimZilla is online. What are we building?")
+        self._voice.say("Bonjour. ZimZilla est prêt. Que veux-tu faire ?")
 
     def _voice_note_call(self, ev: dict) -> None:
         name = str(ev.get("name") or "")
@@ -3160,6 +3253,7 @@ class ZimZillaApp(App):
             # catalog and the limits, which is the whole surface.
             "zim-flex": lambda a: self._cmd_zim_source("flex", a),
             "zim-gemini": lambda a: self._cmd_zim_source("gemini", a),
+            "coli": lambda a: self._cmd_zim_source("coli", a),
             "gemini-api-setup": lambda a: self._cmd_gateway_key("gemini", a),
             "gemini-models": lambda a: self._cmd_models(["gemini"]),
             "flex-models": lambda a: self._cmd_models(["flex"]),
@@ -4239,6 +4333,7 @@ class ZimZillaApp(App):
                 return
             fact = self.memory.add("note", text, source="explicit")
             self.agent.memory_note = self.memory.prompt_note()
+            self.agent._invalidate_system_prompt()
             if fact is None:
                 self._sys_line("nothing to remember", warn=True)
             else:
@@ -4251,6 +4346,7 @@ class ZimZillaApp(App):
                 return
             removed = self.memory.forget(query)
             self.agent.memory_note = self.memory.prompt_note()
+            self.agent._invalidate_system_prompt()
             self._sys_line(f"forgot {removed} fact(s)" if removed
                            else "no matching fact", ok=bool(removed),
                            warn=not removed)
@@ -4258,6 +4354,7 @@ class ZimZillaApp(App):
         if sub == "clear":
             self.memory.clear()
             self.agent.memory_note = ""
+            self.agent._invalidate_system_prompt()
             self._sys_line("operator memory cleared", ok=True)
             return
         self.query_one(ChatPane).write_block(self.memory.render())
@@ -4681,21 +4778,27 @@ class ZimZillaApp(App):
         p = self.palette
         if not args:
             current = self.cfg.reasoning_effort
+            automatic_colibri = (
+                current is None and not self.agent._effort_explicit
+                and sources_mod.active_key(self.cfg.base_url) == "coli")
+            shown = "low (Colibri par défaut)" if automatic_colibri else current or "off"
+            effective = "low" if automatic_colibri else current
             t = Text()
             t.append("  REASONING EFFORT\n\n", style=f"bold {p.accent}")
             t.append("  now          ", style=p.dim)
-            t.append(f"{current or 'off'}\n", style=f"bold {p.primary}")
+            t.append(f"{shown}\n", style=f"bold {p.primary}")
             t.append("  on the wire  ", style=p.dim)
             t.append(
-                effort_mod.describe(current, self.agent.protocol,
+                effort_mod.describe(effective, self.agent.protocol,
                                     self.agent.output_ceiling(),
                                     model=self.cfg.model,
                                     adaptive=self.agent._adaptive_thinking) + "\n\n",
                 style=p.primary)
             for name in effort_mod.LEVEL_ORDER:
                 spec = effort_mod.LEVELS[name]
-                mark = "◉" if name == current else "○"
-                style = f"bold {p.accent}" if name == current else p.primary
+                selected = name == effective
+                mark = "◉" if selected else "○"
+                style = f"bold {p.accent}" if selected else p.primary
                 t.append(f"  {mark} {name:<8}", style=style)
                 t.append(spec.blurb + "\n", style=p.dim)
             t.append("\n  set it with  ", style=p.dim)
@@ -4713,6 +4816,7 @@ class ZimZillaApp(App):
             return
         level = effort_mod.normalise(str(args[0]))
         self.cfg.reasoning_effort = level
+        self.agent._effort_explicit = True
         effort_mod.persist(level)
         if level is None:
             self._sys_line(
@@ -4790,6 +4894,49 @@ class ZimZillaApp(App):
                                ok=True)
                 found = sources_mod.discover()
 
+        if key == "coli" and args and args[0].startswith(("http://", "https://")):
+            # Allow overriding the host-gateway URL and save the selection.
+            url = args[0].rstrip("/")
+            try:
+                profile = sources_mod.ZIMZILLA_HOME / "coli" / "source"
+                profile.parent.mkdir(parents=True, exist_ok=True)
+                profile.write_text(
+                    f'export ANTHROPIC_BASE_URL="{url}"\n'
+                    'export ANTHROPIC_MODEL=""\n'
+                    'export ANTHROPIC_AUTH_TOKEN="colibri"\n'
+                    'export ANTHROPIC_API_KEY=""\n', encoding="utf-8")
+                profile.chmod(0o600)
+                sources_mod.COLI_DIRECT = sources_mod.DirectRoute(base_url=url)
+            except OSError as e:
+                self._sys_line(f"could not save Colibri endpoint: {e}", warn=True)
+                return
+            found = sources_mod.discover()
+            self._sys_line(f"Colibri endpoint saved: {url}", ok=True)
+            self._switch_source(found["coli"])
+            return
+        if key == "coli" and ("coli" not in found):
+            try:
+                profile = sources_mod.ZIMZILLA_HOME / "coli" / "source"
+                profile.parent.mkdir(parents=True, exist_ok=True)
+                profile.write_text(
+                    'export ANTHROPIC_BASE_URL="http://127.0.0.1:8000/v1"\n'
+                    'export ANTHROPIC_MODEL=""\n'
+                    'export ANTHROPIC_AUTH_TOKEN="colibri"\n'
+                    'export ANTHROPIC_API_KEY=""\n', encoding="utf-8")
+                profile.chmod(0o600)
+                found = sources_mod.discover()
+            except OSError as e:
+                self._sys_line(f"could not configure Colibri: {e}", warn=True)
+                return
+        if key == "coli" and args and args[0].strip().lower() in ("help", "status"):
+            self._sys_line(
+                "Colibri must be running on Windows at the configured endpoint. "
+                "WSL2 localhost forwarding is used by default; use "
+                "/coli http://<Windows-host-IP>:8000/v1 to override the endpoint. "
+                "The model id is read automatically from /v1/models.",
+                ok=True)
+            return
+
         if key is None:
             # Bare /zim-source: just show what is available and which is live.
             active = sources_mod.active_key(self.cfg.base_url)
@@ -4858,6 +5005,7 @@ class ZimZillaApp(App):
                 ("inferbase", ib_mod, "Inferbase", "/inferbase-api-setup"),
                 ("flex", flex_mod, "Flex playground", "no key needed"),
                 ("gemini", gm_mod, "Google Gemini", "/gemini-api-setup"),
+                ("coli", None, "Colibri (Windows)", "run Colibri on Windows"),
             ):
                 # IteraCompute and InfronAI have local proxies, so when their
                 # profiles exist they are already listed above by discover() —
@@ -4866,7 +5014,7 @@ class ZimZillaApp(App):
                 # like two.
                 if _kind in found:
                     continue
-                creds = _mod.load_credentials()
+                creds = _mod.load_credentials() if _mod is not None else None
                 mark = "◉" if active == _kind else "○"
                 style = f"bold {p.accent}" if active == _kind else p.primary
                 t.append(f"  {mark} {_kind:<12}", style=style)
@@ -4876,7 +5024,7 @@ class ZimZillaApp(App):
                     t.append(f":{_mod.PROXY_PORT}  {_label:<12} ",
                              style=p.primary)
                 elif _kind in ("nvidia", "inferx", "inferbase", "flex",
-                               "gemini"):
+                               "gemini", "coli"):
                     # Neither hosted-by-us nor proxied: the upstream is reached
                     # directly, so the row says so the way Token Juice's does.
                     # There is no port, and "proxy down" would be a lie.
@@ -4933,7 +5081,7 @@ class ZimZillaApp(App):
                      "                 /zim-moonmath,  /zim-coarena,\n"
                      "                 /zim-wandb,\n"
                      "                 /zim-inferx,  /zim-inferbase,\n"
-                     "                 /zim-flex,  /zim-gemini,\n"
+                     "                 /zim-flex,  /zim-gemini,  /coli\n"
                      "                 or  /zim-antseed\n",
                      style=p.dim)
             # Any route that is present but parked is named once here, so the
@@ -5171,13 +5319,44 @@ class ZimZillaApp(App):
                     f"{src.profile}", warn=True)
                 return
             wanted = profile.get("ANTHROPIC_MODEL") or src.model
-            chosen, replaced, ok, detail = await asyncio.to_thread(
-                self._probe_direct, src, route, route.upstream_model(wanted), token)
+            if src.key == "coli":
+                from .. import openai_compat as oa_mod
+                chosen, replaced, ok, detail = await asyncio.to_thread(
+                    self._probe_direct, src, route, wanted, token)
+                ids = oa_mod.cached_ids(route.base_url)
+                if ids:
+                    chosen, replaced = ids[0], None
+                elif not chosen or not ok:
+                    self._sys_line(
+                        "Colibri tourne sur Windows, mais WSL ne peut pas joindre "
+                        f"{route.base_url}. Active le réseau miroir de WSL2 pour "
+                        "partager 127.0.0.1 avec Windows, puis redémarre WSL. "
+                        f"Détail : {detail}",
+                        warn=True)
+                    return
+            else:
+                chosen, replaced, ok, detail = await asyncio.to_thread(
+                    self._probe_direct, src, route, route.upstream_model(wanted), token)
         finally:
             self.busy = False
             bar.set_activity("idle", busy=False)
             bar.render_bar()
             self.query_one("#input", Input).focus()
+
+        if src.key == "coli" and chosen:
+            # Keep the discovered server model across restarts; otherwise the
+            # generic default model would be sent to Colibri on the next run.
+            try:
+                profile_path = sources_mod.ZIMZILLA_HOME / "coli" / "source"
+                profile_path.parent.mkdir(parents=True, exist_ok=True)
+                profile_path.write_text(
+                    f'export ANTHROPIC_BASE_URL="{route.base_url}"\n'
+                    f'export ANTHROPIC_MODEL="{chosen}"\n'
+                    f'export ANTHROPIC_AUTH_TOKEN="{token or "colibri"}"\n'
+                    'export ANTHROPIC_API_KEY=""\n', encoding="utf-8")
+                profile_path.chmod(0o600)
+            except OSError as e:
+                self._sys_line(f"could not save Colibri model: {e}", warn=True)
 
         self.cfg.base_url = route.base_url
         self.cfg.protocol = "openai"
@@ -5445,6 +5624,11 @@ class ZimZillaApp(App):
         touches no widget.
         """
         from .. import openai_compat as oa_mod
+
+        if src.key == "coli":
+            ok, detail = oa_mod.probe(route.base_url, token)
+            ids = oa_mod.cached_ids(route.base_url)
+            return (ids[0] if ids else chosen), None, ok, detail
 
         if src.key == "nvidia":
             # NVIDIA's Models route is PUBLIC — it answers 200 with no key and
@@ -7107,7 +7291,7 @@ class ZimZillaApp(App):
                  "aihubmix",
                  "beatapi", "coarena",
                  "moonmath", "iteracompute", "infronai", "nvidia", "wandb",
-                 "inferx", "inferbase", "flex", "gemini", "deepai"}
+                 "inferx", "inferbase", "flex", "gemini", "deepai", "coli"}
         if key not in known:
             self._sys_line(
                 f"unknown upstream: {key} — try one of "
@@ -7260,7 +7444,7 @@ class ZimZillaApp(App):
             creds = gm_mod.load_credentials()
             if creds is None:
                 return None, "no key — set one with /gemini-api-setup <key>"
-            return gm_mod.usable_free_models(creds[0])
+            return gm_mod.chat_models(creds[0])
         if kind == "deepai":
             # Key-gated, not public: the catalog answers 401 without a
             # credential, so the key is read from ZimZilla's own profile when
@@ -7269,6 +7453,12 @@ class ZimZillaApp(App):
             # the paid lanes, which answer 200 and spend Theos.
             creds = deepcode_mod.load_credentials()
             return deepcode_mod.usable_free_models(creds[0] if creds else "")
+        if kind == "coli":
+            from .. import openai_compat as oa_mod
+            models = oa_mod.cached_ids(sources_mod.COLI_DIRECT.base_url)
+            if models:
+                return models, ""
+            return None, "Colibri n’a pas encore annoncé son modèle ; utilise /coli pour détecter son modèle unique."
         if kind == "flex":
             # No key and no fetch: the playground publishes no catalog, so this
             # is the module's declared list. `usable_free_models` filters it to
@@ -9838,15 +10028,13 @@ class ZimZillaApp(App):
         return "".join(parts)
 
     def _cmd_bug_hunt(self, args) -> None:
-        """/bug-hunt [--fresh] [--wave N] <target> — recon, then one wave.
+        """/bug-hunt [--fresh] [--wave N] <target> — recon, then up to eight waves.
 
-        Recon maps the target (or reuses notes already on disk), a read-only
-        planner writes ten briefs, all ten run at once, their findings land in
-        the wave's own directory — and the command stops there. Whether there is
-        another wave is the operator's call, which is the point: a campaign that
-        planned wave 2 straight after wave 1 found a critical was spending
-        tokens on work nobody asked for and could not decline. See
-        zimzilla/hunt.py.
+        Recon maps the target (or reuses notes already on disk), then a
+        read-only planner chooses up to five distinct checks per wave. Findings
+        and failures feed the next plan, for at most eight waves. The planner
+        may stop early when coverage is complete; /stop-hunt remains available
+        throughout. See zimzilla/hunt.py.
 
         ``--wave N`` runs wave N specifically; without it the next wave the
         scope has not run yet. ``--fresh`` forces the mapping phase even when
@@ -9948,9 +10136,10 @@ class ZimZillaApp(App):
         t.append("  ◈ WAVE      ", style=f"bold {p.accent}")
         t.append(f"wave {running} — ", style=f"bold {p.primary}")
         t.append(
-            f"{hunt_mod.HUNT_WAVE_SIZE} agents, all concurrent, then it stops\n"
+            f"up to {hunt_mod.BUG_HUNT_MAX_WAVES} waves · "
+            f"{hunt_mod.HUNT_WAVE_SIZE} agents at once, planner stops when covered\n"
             if wave_number is None else
-            f"{hunt_mod.HUNT_WAVE_SIZE} agents, all concurrent\n",
+            f"one selected wave · at most {hunt_mod.HUNT_WAVE_SIZE} agents at once\n",
             style=p.primary,
         )
         t.append("  ◈ EVIDENCE  ", style=f"bold {p.accent}")
@@ -9963,7 +10152,7 @@ class ZimZillaApp(App):
         )
         t.append("  · ", style=p.dim)
         t.append("/stop-hunt", style=p.primary)
-        t.append(" ends the wave   ·   ", style=p.dim)
+        t.append(" ends the campaign   ·   ", style=p.dim)
         t.append("/summary-hunt", style=p.primary)
         t.append(" writes the report   ·   ", style=p.dim)
         t.append("/report-bug-hunt", style=p.primary)
@@ -10715,6 +10904,9 @@ class ZimZillaApp(App):
         offered unlimited coins and no ad breaks, and nothing in this file
         knows what Flappy Bird is.
 
+        A web URL is mapped from a bounded set of public pages instead of being
+        resolved as a local file. `--map` stops before the model turn entirely.
+
         `--map` stops before the turn entirely. The map alone is often the
         whole answer, and it is the version that is safe to run against a file
         whose provenance you are unsure of — nothing leaves the process.
@@ -10734,6 +10926,24 @@ class ZimZillaApp(App):
         raw = " ".join(rest)
         if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
             raw = raw[1:-1]
+
+        # Chat often supplies a pasted Markdown link, not a bare URL. Accept
+        # both forms before deciding whether this is a local artifact or a site.
+        markdown = re.fullmatch(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", raw.strip())
+        if markdown:
+            raw = markdown.group(2)
+
+        from urllib.parse import urlsplit
+        parsed_url = urlsplit(raw)
+        if parsed_url.scheme.lower() in ("http", "https") and parsed_url.netloc:
+            if parsed_url.username or parsed_url.password:
+                self._sys_line("refused: credentials in a URL are not supported", warn=True)
+                return
+            if self.busy and not map_only:
+                self._sys_line("harness is busy — Ctrl+C to interrupt", warn=True)
+                return
+            self._run_reverse_site(raw, map_only=map_only)
+            return
 
         # Resolved against the session workdir, through the jail, like every
         # other path this harness is handed. A bare `app.apk` has to mean
@@ -10774,6 +10984,53 @@ class ZimZillaApp(App):
             reverse_mod.build_prompt(artifact, inv, probes),
             display=f"⌬ /reverse-engineer {path.name}",
         )
+
+    @work(thread=True, exclusive=True, group="reverse-site-map")
+    def _run_reverse_site(self, url: str, *, map_only: bool = False) -> None:
+        """Map a small, same-origin sample of a site and optionally brief the agent."""
+        from ..reverse import map_site
+
+        try:
+            site_map = map_site(url)
+        except Exception as exc:  # noqa: BLE001 - surface network/parser errors cleanly
+            self.call_from_thread(
+                self._sys_line,
+                f"site mapping failed: {type(exc).__name__}: {exc}", True,
+            )
+            return
+
+        self.call_from_thread(self._display_reverse_site, site_map, map_only)
+
+    def _display_reverse_site(self, site_map, map_only: bool) -> None:
+        """Render a completed site map on the Textual app thread."""
+
+        p = self.palette
+        t = Text()
+        t.append("  SITE         ", style=f"bold {p.accent}")
+        t.append(f"{site_map.url}\n", style=p.primary)
+        t.append("  RESULT       ", style=f"bold {p.accent}")
+        t.append(f"{site_map.status} · {site_map.title or '(no title)'}\n", style=p.dim)
+        if site_map.technologies:
+            t.append("  TECHNOLOGY   ", style=f"bold {p.accent}")
+            t.append(", ".join(site_map.technologies) + "\n", style=p.dim)
+        if site_map.pages:
+            t.append("\n  PAGES\n", style=f"bold {p.accent}")
+            for page in site_map.pages:
+                t.append(f"  {page.status:<4} ", style=p.primary)
+                t.append(f"{page.url}\n", style=p.dim)
+        if site_map.forms:
+            t.append("\n  FORMS\n", style=f"bold {p.accent}")
+            for form in site_map.forms:
+                t.append(f"  {form}\n", style=p.dim)
+        if site_map.notes:
+            t.append("\n  NOTES\n", style=f"bold {p.accent}")
+            for note in site_map.notes:
+                t.append(f"  {note}\n", style=p.dim)
+        self.query_one(ChatPane).write_block(t)
+        if map_only:
+            self._sys_line("--map — site map completed; no model turn started", ok=True)
+            return
+        self._run_turn(site_map.prompt, display=f"⌬ /reverse-engineer {site_map.host}")
 
     def _render_artifact_map(self, art, inv, probes) -> Text:
         """The map, for the transcript. Rendering only — no probing here."""
@@ -10848,7 +11105,8 @@ class ZimZillaApp(App):
             t.append(f"  {command:<34}", style=f"bold {p.primary}")
             t.append(blurb + "\n", style=p.dim)
         t.append("\n  Works on ", style=p.dim)
-        t.append(".apk · .jar · .zip · .exe · .dll · .so · ELF · Mach-O · "
+        t.append("public website URLs (bounded read-only sample) and local files: "
+                 ".apk · .jar · .zip · .exe · .dll · .so · ELF · Mach-O · "
                  ".dex · .sh and other scripts", style=p.primary)
         t.append("\n  — and on a directory, which it triages first.\n", style=p.dim)
         # Say this here rather than only in the refusal: a path outside the
@@ -10857,9 +11115,9 @@ class ZimZillaApp(App):
         # time the operator learns there is a boundary.
         t.append(f"\n  Paths resolve against the session directory "
                  f"({self.cfg.workdir}).\n", style=p.dim)
-        t.append("\n  The map is built locally from the file's own bytes. "
-                 "Nothing is\n  executed, nothing is modified, and with "
-                 "--map nothing is sent anywhere.\n", style=p.dim)
+        t.append("\n  Local artifacts are mapped from their bytes. Website URLs get "
+                 "at most five same-origin GETs; no forms are submitted. "
+                 "With --map, no model turn starts.\n", style=p.dim)
         t.append("\n  Point it at artifacts you own or are authorised to take "
                  "apart.\n", style=p.amber)
         self.query_one(ChatPane).write_block(t)
@@ -11537,6 +11795,41 @@ class ZimZillaApp(App):
                 if names:
                     self._sys_line(f"launching {len(ev['workers'])} — {names}", ok=True)
 
+            elif etype == "hunt_plan_complete":
+                self._close_wave(web)
+                self._sys_line(
+                    "coverage complete — " + str(ev.get("message") or
+                                                  "no further checks planned"),
+                    ok=True,
+                )
+
+            elif etype == "hunt_validation_start":
+                self._sys_line(
+                    f"final independent validation — {ev.get('count', 0)} finding(s)",
+                    ok=True,
+                )
+
+            elif etype == "hunt_validation_done":
+                status = str(ev.get("status") or "INCONCLUSIVE").upper()
+                self._sys_line(
+                    f"{ev.get('name', 'verification')}: {status.lower()} — "
+                    f"{str(ev.get('digest') or '')[:280]}",
+                    ok=status == "CONFIRMED",
+                    warn=status != "CONFIRMED",
+                )
+
+            elif etype == "hunt_model_fallback":
+                self.agent.set_model(str(ev.get("model") or self.cfg.model))
+                model_name = self.cfg.display_model
+                self.query_one(HeaderBar).set_model(model_name)
+                self.query_one(StatusBar).model = model_name
+                self._sys_line(
+                    f"{ev.get('provider', 'provider')} quota reached for "
+                    f"{ev.get('previous', 'current model')} — continuing with "
+                    f"{ev.get('model')}",
+                    warn=True,
+                )
+
             elif etype == "hunt_agent_start":
                 counter["running"] += 1
                 color = agent_color(ev.get("index", 0), p)
@@ -11637,6 +11930,9 @@ class ZimZillaApp(App):
                 self._sys_line(f"report archived: {ev.get('path')}", ok=True)
 
             elif etype == "hunt_end":
+                if ev.get("stop_reason"):
+                    self._sys_line(
+                        "campaign stopped — " + str(ev["stop_reason"]), warn=True)
                 self._sys_line(
                     f"hunt ended — {ev['wave']} wave(s), {ev['findings']} finding(s), "
                     f"{ev['saved']} report(s) in {ev['directory']}",
@@ -11660,6 +11956,9 @@ class ZimZillaApp(App):
                 run=self._hunt_run,
                 fresh=fresh,
                 wave_number=wave_number,
+                max_waves=(hunt_mod.BUG_HUNT_MAX_WAVES
+                           if (kind is None or kind.command == "bug-hunt")
+                           and wave_number is None else 1),
                 kind=kind,
             )
             # A summary asked for but never delivered — the hunt was stopped
@@ -12089,7 +12388,7 @@ class ZimZillaApp(App):
             ("/phish", "clone a login page and harvest creds", "phish"),
             ("/image-gen", "generate an image from a prompt", "image-gen"),
             ("/payload", "build a payload for a file extension", "payload"),
-            ("/bug-hunt", "recon, then one wave of 10 agents", "bug-hunt"),
+            ("/bug-hunt", "recon, then up to eight adaptive waves", "bug-hunt"),
             ("/ad", "Active Directory campaign — gated and interlocked", "ad"),
             ("/crack", "crack hashes offline — CPU only, budgeted", "crack"),
             ("/clip", "find the best moments in a video and cut them", "clip"),

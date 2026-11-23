@@ -53,10 +53,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scope", default=None,
                         help="DEPRECATED — replaced by --allow / --deny; ignored with a warning")
     parser.add_argument("--sandbox", action="store_true",
-                        help="re-enable the filesystem jail (default: unrestricted — "
-                             "file tools may use any path)")
-    # Kept as a no-op for old launch scripts: --unsafe used to opt out, and the
-    # default is now the same behaviour.
+                        help="keep file tools inside the working directory (default)")
+    # Kept as a compatibility flag for older launch scripts; the filesystem
+    # jail remains active by default.
     parser.add_argument("--unsafe", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--ask-mcp", action="store_true",
                         help="ask before every MCP tool call (default: auto-allow; "
@@ -254,8 +253,9 @@ def main(argv: list[str] | None = None) -> int:
         allow_path=allow_path,
         deny_path=deny_path,
         legacy_scope_path=legacy_scope,
-        # Unrestricted by default, by request. `--sandbox` is the opt-in.
-        unsafe=not args.sandbox,
+        # Keep the filesystem jail on by default. --unsafe remains an explicit
+        # opt-out for compatibility; --sandbox documents/reaffirms the default.
+        unsafe=args.unsafe,
         theme=theme,
         max_tokens=args.max_tokens,
         # `from_env` applies only non-None overrides, so False is passed
@@ -299,6 +299,22 @@ def main(argv: list[str] | None = None) -> int:
     # and skipping the re-apply there meant a key changed in-app worked once and
     # then silently reverted on the next launch.
     _remembered = sources_mod.current_key()
+    if _remembered == "coli" and not args.base_url and not os.environ.get("OPENAI_BASE_URL"):
+        _profile = sources_mod.load_profile(
+            sources_mod.discover().get("coli") or sources_mod.Source(
+                key="coli", label="Colibri", port=0,
+                profile=sources_mod.ZIMZILLA_HOME / "coli" / "source",
+                model="", root=sources_mod.DEFAULT_ROOT,
+                direct=sources_mod.COLI_DIRECT))
+        cfg.base_url = _profile.get("ANTHROPIC_BASE_URL", sources_mod.COLI_DIRECT.base_url)
+        cfg.model = _profile.get("ANTHROPIC_MODEL", "")
+        if cfg.model.strip().lower() in ("", "default"):
+            # Colibri serves one known model. Do not probe /v1/models here:
+            # that network round-trip blocked the UI on every cold launch.
+            cfg.model = sources_mod.COLI_MODEL
+        cfg.auth_token = _profile.get("ANTHROPIC_AUTH_TOKEN") or "colibri"
+        cfg.api_key = ""
+        cfg.protocol = "openai"
     for _key, _mod in (("tokenharbour", th_mod), ("openrouter", or_mod),
                        ("unorouter", uno_mod), ("unrestricted", unr_mod),
                        ("respan", rp_mod), ("numes", nm_mod),
@@ -418,8 +434,14 @@ def main(argv: list[str] | None = None) -> int:
     # of main() skips the check entirely, so a flaky fetch cannot make the
     # harness restart itself repeatedly.
     if not os.environ.get("ZIMZILLA_UPDATED"):
+        # Never wait on GitHub when this checkout lives on a Windows-mounted
+        # drive under WSL: metadata walks in /mnt/c are slow, and updates are
+        # optional. Native Linux checkouts keep the automatic check.
+        _mounted_wsl = ("microsoft" in os.uname().release.lower()
+                        and str(Path(__file__).resolve()).startswith("/mnt/"))
         result = update_mod.run(enabled=not args.no_update
-                                and os.environ.get("ZIMZILLA_NO_UPDATE") != "1")
+                                and os.environ.get("ZIMZILLA_NO_UPDATE") != "1"
+                                and not _mounted_wsl)
         if result.noteworthy:
             update_mod.format_result(result)
         if result.should_reexec:

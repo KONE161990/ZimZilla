@@ -309,6 +309,12 @@ def chat_completions_url(base_url: str) -> str:
         if url.endswith("/v1beta"):
             return url + "/openai/chat/completions"
         return url + "/v1beta/openai/chat/completions"
+    # Colibri is served on Windows while ZimZilla may run under WSL. Keep its
+    # regular OpenAI-compatible /v1/models route for discovering the loaded id.
+    if _host_of(url) in ("localhost", "127.0.0.1", "host.docker.internal") \
+            and ":8000" in url:
+        return url + ("/chat/completions" if url.endswith("/v1")
+                      else "/v1/chat/completions")
     if url.endswith("/v1"):
         return url + "/chat/completions"
     return url + CHAT_PATH
@@ -337,6 +343,9 @@ def models_url(base_url: str) -> str:
         if url.endswith("/v1beta"):
             return url + "/openai/models"
         return url + "/v1beta/openai/models"
+    if _host_of(url) in ("localhost", "127.0.0.1", "host.docker.internal") \
+            and ":8000" in url and not url.endswith("/v1"):
+        return url + "/v1/models"
     if url.endswith("/v1"):
         return url + "/models"
     return url + "/v1/models"
@@ -347,6 +356,7 @@ def models_url(base_url: str) -> str:
 #: can offer the endpoint's real ids instead of this harness's default snapshot
 #: — which for a hand-typed endpoint is a list of names it has never served.
 _MODEL_CACHE: dict[str, tuple[str, ...]] = {}
+_MODEL_CONTEXT_CACHE: dict[str, dict[str, int]] = {}
 
 
 def _cache_key(base_url: str) -> str:
@@ -360,6 +370,11 @@ def cached_ids(base_url: str) -> tuple[str, ...]:
     blocking network read there would stall the UI thread.
     """
     return _MODEL_CACHE.get(_cache_key(base_url), ())
+
+
+def cached_context_length(base_url: str, model: str) -> int | None:
+    """The context length reported by a direct endpoint's Models response."""
+    return _MODEL_CONTEXT_CACHE.get(_cache_key(base_url), {}).get(model)
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +391,8 @@ class Block:
     id: str | None = None
     name: str | None = None
     input: dict | None = None
+    thought_signature: str | None = None
+    extra_content: dict | None = None
 
     def model_dump(self, exclude_none: bool = False) -> dict:
         return {k: v for k, v in self.__dict__.items()
@@ -513,7 +530,7 @@ def translate_messages(system: Any, messages: list[dict]) -> list[dict]:
                     if block.get("text"):
                         texts.append(block["text"])
                 elif kind == "tool_use":
-                    calls.append({
+                    call = {
                         "id": block.get("id") or f"call_{len(calls)}",
                         "type": "function",
                         "function": {
@@ -521,7 +538,15 @@ def translate_messages(system: Any, messages: list[dict]) -> list[dict]:
                             "arguments": json.dumps(block.get("input") or {},
                                                     ensure_ascii=False),
                         },
-                    })
+                    }
+                    extra = block.get("extra_content")
+                    signature = block.get("thought_signature")
+                    if isinstance(extra, dict):
+                        call["extra_content"] = extra
+                    elif signature is not None:
+                        call["extra_content"] = {
+                            "google": {"thought_signature": signature}}
+                    calls.append(call)
             text = "\n\n".join(texts)
             # An assistant turn that carried neither text nor a call is not
             # representable: OpenAI rejects a message with null content and no
@@ -691,6 +716,23 @@ _PARAM_RE = re.compile(
 _TOOLCALLS_RE = re.compile(
     r"<([^<>]*?)tool_calls\s*>(.*?)</([^<>]*?)tool_calls\s*>", re.S | re.I)
 
+# Colibri/Qwen's local systemone endpoint can serialize a tool request inside
+# text using this alternate form (rather than OpenAI `tool_calls` or the
+# `<invoke name=...>` form above):
+#
+#     <tool_call><function=read_file>
+#       <parameter=path>/workspace/AGENTS.md</parameter>
+#     </function></tool_call>
+#
+# Treat that exact envelope as structured intent, then pass it through the
+# normal tool-name/argument normalization and permission path in Agent.
+_XML_TOOL_CALL_RE = re.compile(
+    r"<tool_call\b[^>]*>(.*?)</tool_call\s*>", re.S | re.I)
+_XML_FUNCTION_RE = re.compile(
+    r"<function\s*=\s*([\w.-]+)\s*>(.*?)</function\s*>", re.S | re.I)
+_XML_PARAMETER_RE = re.compile(
+    r"<parameter\s*=\s*([\w.-]+)\s*>(.*?)</parameter\s*>", re.S | re.I)
+
 #: How many trailing characters are held back from the live stream so a marker
 #: split across two chunks is never emitted as prose. Sized for the longest
 #: marker *including* a namespace prefix — DeepSeek writes
@@ -706,7 +748,7 @@ _MARKER_HOLDBACK = 32
 #: the regexes below accept, which is how the parser came to be dead code for
 #: the one model it was written for — the guard returned early, the markup went
 #: to the transcript as prose, and the tool never ran.
-_CALL_KEYWORDS = ("invoke", "tool_calls")
+_CALL_KEYWORDS = ("invoke", "tool_calls", "tool_call", "function=")
 
 
 def _has_call_markup(text: str) -> bool:
@@ -755,6 +797,17 @@ def parse_text_tool_calls(text: str) -> tuple[str, list[dict]]:
             if key:
                 args[key] = (param.group(3) or "").strip()
         calls.append({"name": name, "input": args})
+    for envelope in _XML_TOOL_CALL_RE.finditer(text):
+        for function in _XML_FUNCTION_RE.finditer(envelope.group(1) or ""):
+            name = (function.group(1) or "").strip()
+            if not name:
+                continue
+            args = {}
+            for param in _XML_PARAMETER_RE.finditer(function.group(2) or ""):
+                key = (param.group(1) or "").strip()
+                if key:
+                    args[key] = (param.group(2) or "").strip()
+            calls.append({"name": name, "input": args})
     if not calls:
         return text, []
     # Remove the calls, then the wrapper they sat in, then tidy the blank lines
@@ -762,6 +815,7 @@ def parse_text_tool_calls(text: str) -> tuple[str, list[dict]]:
     # truncated reply.
     prose = _INVOKE_RE.sub("", text)
     prose = _TOOLCALLS_RE.sub("", prose)
+    prose = _XML_TOOL_CALL_RE.sub("", prose)
     prose = re.sub(r"\n{3,}", "\n\n", prose).strip()
     return prose, calls
 
@@ -847,6 +901,8 @@ class Accumulator:
         self.text: list[str] = []
         self.reasoning: list[str] = []
         self.calls: dict[int, dict] = {}
+        self._call_ids: dict[str, int] = {}
+        self._last_unindexed_call: int | None = None
         self.finish_reason: str | None = None
         self.usage = Usage()
         #: Text held back from the live stream because it might be the start of
@@ -993,13 +1049,66 @@ class Accumulator:
         if not isinstance(call, dict):
             return
         index = call.get("index")
-        if not isinstance(index, int):
-            # No index: the call is complete in one piece (some servers, and
-            # every non-streamed response). Key it by its id, or by count.
-            index = len(self.calls)
-        slot = self.calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
+        if isinstance(index, int):
+            self._last_unindexed_call = index
+            if call.get("id"):
+                self._call_ids[call["id"]] = index
+        else:
+            # Google's OpenAI-compatible stream can omit the OpenAI `index`.
+            # Reuse a call id when present; for a one-call stream, keep later
+            # argument fragments on that same slot even when the id/name only
+            # appeared in the opening chunk.
+            call_id = call.get("id")
+            if call_id and call_id in self._call_ids:
+                index = self._call_ids[call_id]
+            elif call_id:
+                index = max(self.calls, default=-1) + 1
+                self._call_ids[call_id] = index
+                self._last_unindexed_call = index
+            elif (call.get("function") or {}).get("name"):
+                name_hint = (call.get("function") or {}).get("name")
+                matching = next((i for i, existing in self.calls.items()
+                                 if existing.get("name") == name_hint), None)
+                if matching is not None:
+                    index = matching
+                else:
+                    current = self.calls.get(self._last_unindexed_call)
+                    if current and current.get("name") and not (
+                            current["name"].startswith(name_hint)
+                            or name_hint.startswith(current["name"])):
+                        index = max(self.calls, default=-1) + 1
+                        self._last_unindexed_call = index
+                    elif self._last_unindexed_call is not None:
+                        index = self._last_unindexed_call
+                    else:
+                        index = max(self.calls, default=-1) + 1
+                        self._last_unindexed_call = index
+            elif len(self.calls) == 1:
+                index = next(iter(self.calls))
+                self._last_unindexed_call = index
+            elif self._last_unindexed_call is not None and len(self.calls) > 1:
+                # Many providers group each call's fragments before starting
+                # the next one, but do not promise that. Prefer the current
+                # group until a new id/name identifies another call.
+                index = self._last_unindexed_call
+            else:
+                index = max(self.calls, default=-1) + 1
+                self._last_unindexed_call = index
+        slot = self.calls.setdefault(index, {
+            "id": "", "name": "", "arguments": "",
+            "thought_signature": None, "extra_content": None,
+        })
         if call.get("id"):
             slot["id"] = call["id"]
+        signature = call.get("thought_signature") or call.get("thoughtSignature")
+        extra = call.get("extra_content") or call.get("extraContent")
+        if isinstance(extra, dict):
+            slot["extra_content"] = extra
+            google = extra.get("google")
+            if isinstance(google, dict):
+                signature = signature or google.get("thought_signature")
+        if signature is not None:
+            slot["thought_signature"] = signature
         function = call.get("function") or {}
         if not isinstance(function, dict):
             return
@@ -1048,6 +1157,8 @@ class Accumulator:
                 id=call["id"] or f"call_{index}",
                 name=call["name"],
                 input=parse_arguments(call["arguments"]),
+                thought_signature=call.get("thought_signature"),
+                extra_content=call.get("extra_content"),
             ))
         # Calls recovered from the text come after the real ones, and are keyed
         # past them so their ids cannot collide with a server-assigned id.
@@ -1520,7 +1631,7 @@ class Client:
         self,
         base_url: str,
         api_key: str | None = None,
-        timeout: float = 120.0,
+        timeout: float | None = 120.0,
         stream: bool = True,
         transport: Any = None,
         extra_headers: dict | None = None,
@@ -1531,12 +1642,13 @@ class Client:
         self.stream_enabled = stream
         self.transport = transport
         self.extra_headers = dict(extra_headers or {})
-        # Connect and pool waits are bounded tightly and separately from the
-        # read: the read timeout is the gap between streamed chunks, which is
-        # what a stalled endpoint looks like, and it should not also govern how
-        # long a TCP connect may take.
-        self.timeout = httpx.Timeout(connect=15.0, read=timeout,
-                                     write=30.0, pool=15.0)
+        # A None timeout is deliberately unlimited for local inference servers:
+        # model loading and the first generated token can take a long time.
+        # Otherwise keep connection/pool waits bounded independently from the
+        # streamed read timeout.
+        self.timeout = (httpx.Timeout(None) if timeout is None else
+                        httpx.Timeout(connect=15.0, read=timeout,
+                                      write=30.0, pool=15.0))
         self.messages = _Messages(self)
 
     @property
@@ -1556,10 +1668,11 @@ class Client:
     def payload(self, kwargs: dict, stream: bool) -> dict:
         """Translate the Anthropic-shaped call into a Chat Completions body."""
         payload: dict = {
-            "model": kwargs.get("model") or "",
             "messages": translate_messages(kwargs.get("system") or "",
                                            kwargs.get("messages") or []),
         }
+        if kwargs.get("model"):
+            payload["model"] = kwargs["model"]
         if stream:
             payload["stream"] = True
             # Without this, OpenAI (and anything copying it) sends no usage on a
@@ -1678,5 +1791,13 @@ def probe(base_url: str, api_key: str | None = None, timeout: float = 8.0) -> tu
         # Warm the cache `sources.models_for` reads, so `/model` offers this
         # endpoint's own ids rather than the harness's default snapshot.
         _MODEL_CACHE[_cache_key(base_url)] = tuple(ids)
+        _MODEL_CONTEXT_CACHE[_cache_key(base_url)] = {
+            str(entry["id"]): int(length)
+            for entry in entries
+            if isinstance(entry, dict) and entry.get("id")
+            for length in (entry.get("context_length") or
+                           entry.get("max_model_len"),)
+            if isinstance(length, int) and length > 0
+        }
     preview = ", ".join(ids[:4]) + (" …" if len(ids) > 4 else "")
     return True, f"{len(ids)} models" + (f" ({preview})" if preview else "")

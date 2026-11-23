@@ -209,8 +209,9 @@ class BootScreen(Screen):
             return
 
         if self._phase == "checks":
-            # advance one check roughly every 4 ticks (≈180ms)
-            if self._ticks % 4 == 0:
+            # Advance checks every two ticks (≈90ms) so the animated boot
+            # remains readable without holding the prompt behind it.
+            if self._ticks % 2 == 0:
                 self._check_index += 1
             if self._check_index >= len(self.checks):
                 self._check_index = len(self.checks)
@@ -225,10 +226,10 @@ class BootScreen(Screen):
             if self._ticks >= 8:
                 self._phase = "done"
                 self._render_checks()
-                # Auto-continue. Any buffered text is preserved in the prompt,
-                # so finishing here never truncates what the user typed. The
-                # dwell is long enough to read the credits and the ready line.
-                self.set_timer(2.2, self._finish)
+                # Auto-continue quickly. Any buffered text is preserved in the
+                # prompt, so the operator does not have to wait through a long
+                # decorative pause before typing.
+                self.set_timer(0.35, self._finish)
 
     def _finish(self) -> None:
         if self._finished:

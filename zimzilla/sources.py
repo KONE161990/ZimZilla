@@ -341,13 +341,19 @@ DEEPAI_DIRECT = DirectRoute(
         "deepai/gpt-6-astra": "gpt-6-astra",
     },
 )
+# Colibri serves Chat Completions on Windows; the WSL gateway can be overridden
+# in the private source profile when localhost forwarding is unavailable.
+COLI_DIRECT = DirectRoute(base_url="http://localhost:8000/v1")
+# Colibri serves one local model. Keep its published id locally so starting
+# ZimZilla never waits on a network probe before the interface can open.
+COLI_MODEL = "qwen3.6-colibri"
 
 #: Sources with no proxy at all. Their credential profile is the only file that
 #: has to exist; service and config are absent by design, and ``direct`` says
 #: where they go.
 DIRECT_ONLY: frozenset[str] = frozenset({"logfare", "tokenjuice", "nvidia", "wandb",
                                          "inferx", "inferbase", "flex", "gemini",
-                                         "deepai"})
+                                         "deepai", "coli"})
 
 #: Declared routes for the direct-only sources, keyed like ``MODELS_BY_KEY``.
 DECLARED_ROUTES: dict[str, DirectRoute] = {
@@ -360,6 +366,7 @@ DECLARED_ROUTES: dict[str, DirectRoute] = {
     "flex": FLEX_DIRECT,
     "gemini": GEMINI_DIRECT,
     "deepai": DEEPAI_DIRECT,
+    "coli": COLI_DIRECT,
 }
 
 
@@ -381,6 +388,10 @@ def direct_route(src: Source | None) -> DirectRoute | None:
     if src is None:
         return None
     if src.direct is not None:
+        if src.key == "coli":
+            profile = load_profile(src)
+            return DirectRoute(base_url=profile.get(
+                "ANTHROPIC_BASE_URL", COLI_DIRECT.base_url))
         return src.direct
     if src.config is None or yaml is None:
         return None
@@ -760,6 +771,7 @@ MODELS_BY_KEY: dict[str, tuple[str, ...]] = {
     "inferbase": INFERBASE_MODELS,
     "flex": FLEX_MODELS,
     "deepai": DEEPAI_MODELS,
+    "coli": (),
 }
 
 
@@ -808,6 +820,9 @@ def models_for(base_url: str) -> tuple[str, ...] | None:
         from . import nvidia as nv_mod
         cached = nv_mod.cached_ids()
         return tuple(cached) if cached else (MODELS_BY_KEY.get(key) or None)
+    if key == "coli":
+        from . import openai_compat as oa_mod
+        return oa_mod.cached_ids(base_url) or None
     if key == "logfare":
         # Logfare has its own catalog module, and that is the list /model must
         # offer: it is filtered to chat-capable models and carries health. The
@@ -889,7 +904,8 @@ def models_for(base_url: str) -> tuple[str, ...] | None:
             cached = deepai_mod.cached_ids()
             return tuple(cached) if cached else (MODELS_BY_KEY.get(key) or None)
         from . import openai_compat as oa_mod
-        probed = oa_mod.cached_ids(DECLARED_ROUTES[key].base_url)
+        route = (direct_route(discover().get(key)) or DECLARED_ROUTES[key])
+        probed = oa_mod.cached_ids(route.base_url)
         return tuple(probed) if probed else (MODELS_BY_KEY.get(key) or None)
     if key == "tokenharbour":
         from . import tokenharbour as th_mod
@@ -1067,6 +1083,12 @@ def context_window_for(base_url: str, model: str) -> int | None:
     key = active_key(base_url)
     if key is None:
         return None
+    if key == "coli":
+        from . import openai_compat as oa_mod
+        # Colibri reports these limits on /v1/models; Qwen3.6's current
+        # endpoint publishes a 16K context and the agent must compact history
+        # against that value, not the generic 1M fallback.
+        return oa_mod.cached_context_length(base_url, model) or 16_384
     cached = catalog_models(key)
     if not cached:
         return None
@@ -1384,6 +1406,8 @@ def _profile_candidates(key: str) -> list[Path]:
         return [
             ZIMZILLA_HOME / "gemini" / "source",
         ]
+    if key == "coli":
+        return [ZIMZILLA_HOME / "coli" / "source"]
     if key == "flex":
         # The one source whose profile is NOT a credential: the playground
         # authenticates nothing, so this file records the route and the model.
@@ -1506,6 +1530,9 @@ def discover() -> dict[str, Source]:
     deepai = _build("deepai", "DeepAI Code", 0, "deepai/glm-5.3-flash")
     if deepai:
         found["deepai"] = deepai
+    coli = _build("coli", "Colibri (Windows)", 0, "")
+    if coli:
+        found["coli"] = coli
     return found
 
 
@@ -1549,7 +1576,7 @@ def switchable(exclude: str | None = None) -> list[str]:
                 "coarena",
                 "infronai",
                 "iteracompute", "antseed", "nvidia", "tokenjuice", "logfare",
-                "wandb", "inferx", "inferbase", "flex"):
+                "wandb", "inferx", "inferbase", "flex", "coli"):
         if key == exclude or key in UNDER_CONSTRUCTION:
             continue
         if key in found:
@@ -1600,6 +1627,9 @@ def _gateway_module(key: str):
     from . import crownllm as cl_mod
     from . import kenari as kn_mod
     from . import wandb as wb_mod
+    if _host_of(base_url) in ("host.docker.internal", "localhost", "127.0.0.1") \
+            and ":8000" in (base_url or ""):
+        return "coli"
     return {
         "openrouter": or_mod, "unorouter": uno_mod, "aihubmix": ah_mod,
         "beatapi": bp_mod, "tokenharbour": th_mod, "moonmath": mm_mod,
@@ -1673,7 +1703,7 @@ def _state_file() -> Path:
 BUILTIN_KEYS = frozenset({"tokenharbour", "openrouter", "unorouter", "antseed",
                           "aihubmix", "beatapi", "moonmath", "coarena", "wandb",
                           "inferx", "inferbase", "flex", "unrestricted",
-                          "respan", "numes", "crownllm", "kenari"})
+                          "respan", "numes", "crownllm", "kenari", "coli"})
 
 
 def current_key() -> str | None:
@@ -1820,6 +1850,22 @@ def active_key(base_url: str) -> str | None:
     # environment profile has no file for discover() to find.
     if deepai_mod.is_deepai(base_url):
         return "deepai"
+    # Colibri may be configured with localhost, the WSL host gateway, or a
+    # user-supplied Windows IP. Its remembered selection identifies it even
+    # when the host part differs from the default route.
+    if _host_of(base_url) not in ("localhost", "127.0.0.1", "::1", "0.0.0.0") \
+            and current_key() == "coli":
+        profile = ZIMZILLA_HOME / "coli" / "source"
+        try:
+            configured = _parse_exports(profile.read_text(encoding="utf-8")).get(
+                "ANTHROPIC_BASE_URL", "")
+        except OSError:
+            configured = ""
+        if configured and _host_of(configured) == _host_of(base_url):
+            return "coli"
+    if ":8000" in (base_url or "") and _host_of(base_url) in (
+            "host.docker.internal", "localhost", "127.0.0.1"):
+        return "coli"
     # Checked before the port match, and by port rather than by name: the buyer
     # hands out a plain http://localhost:8377 with no "antseed" in it, and the
     # regex below would otherwise find port 8377, miss it in source_for_port()

@@ -460,7 +460,9 @@ async def run_team(
     # ---- launch, in waves, so no two concurrent workers claim one path.
     lock = asyncio.Lock()
     hook = _write_lock_hook(lock)
-    sem = asyncio.Semaphore(max(1, concurrency))
+    # The team command accepts a programmatic override, but keep the runtime
+    # load bounded even when a caller requests more workers.
+    sem = asyncio.Semaphore(min(5, max(1, concurrency)))
 
     results: list[WorkerResult] = []
     total = len(roster.workers)

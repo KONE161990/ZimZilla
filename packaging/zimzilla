@@ -22,6 +22,9 @@
 
 set -euo pipefail
 
+# Go-installed optional security tools (Nuclei/httpx/etc.) live here.
+export PATH="$HOME/go/bin:$PATH"
+
 # Find the checkout. This launcher lives in <root>/packaging/, so when
 # ZIMZILLA_ROOT is not already exported — run.sh and the installed shim both
 # export it — the checkout is the parent of this file's directory. Symlinks are
@@ -58,6 +61,13 @@ elif command -v python3 >/dev/null 2>&1; then
   PY="$(command -v python3)"
 else
   PY=""
+fi
+
+# WSL on a Windows-mounted checkout pays a large cost for launch-time git
+# metadata walks and network checks. Updates remain available with `git pull`.
+if grep -qi microsoft /proc/version 2>/dev/null \
+   && [[ "$ZIMZILLA_ROOT" == /mnt/* ]]; then
+  export ZIMZILLA_NO_UPDATE=1
 fi
 
 ZIMZILLA_HOME="${ZIMZILLA_HOME:-$HOME/.zimzilla}"
@@ -254,6 +264,14 @@ if [[ "$_current_source" == "flex" ]]; then
   [[ -r "$_fx_profile" ]] || _fx_profile="$ZIMZILLA_ROOT/packaging/flex/source"
   if [[ -r "$_fx_profile" ]]; then
     LITELLM_ENV_FILE="${_env_override:-$_fx_profile}"
+    ZIMZILLA_NO_PROXY=1
+  fi
+fi
+
+if [[ "$_current_source" == "coli" ]]; then
+  _coli_profile="$ZIMZILLA_HOME/coli/source"
+  if [[ -r "$_coli_profile" ]]; then
+    LITELLM_ENV_FILE="${_env_override:-$_coli_profile}"
     ZIMZILLA_NO_PROXY=1
   fi
 fi

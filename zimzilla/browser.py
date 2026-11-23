@@ -15,12 +15,9 @@ the screen, and reads the rendered DOM back out:
 * a viewport screenshot and a full-page screenshot, saved where the operator
   can open them and attached to the model's next request.
 
-The browser is Playwright's Chromium. A bundled browser is used when one is
-installed (``playwright install chromium``); otherwise the system Chromium is
-launched directly, which is what makes the feature work on a machine that
-already has a browser and no Playwright download. Both are optional at import
-time: a harness without them reports the install line instead of failing to
-start.
+The browser is Playwright with Microsoft Edge preferred when available, then
+Playwright's bundled or system Chromium. Both are optional at import time: a
+harness without them reports the install line instead of failing to start.
 
 Nothing here fetches a page for its own sake. The caller (a tool or a command)
 is responsible for the scope guard, and :func:`normalise_url` accepts only
@@ -41,13 +38,6 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-
-#: A real Chrome UA. The default headless UA announces itself, and several
-#: sites answer that announcement with a challenge page instead of content.
-USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
-)
 
 #: A desktop viewport. Wide enough for the three-column layouts these sites
 #: use, small enough that a screenshot stays legible and cheap.
@@ -242,30 +232,51 @@ def normalise_url(url: str) -> str:
 
 
 def _launch_browser(playwright):
-    """Start Chromium, falling back to the system binary.
+    """Prefer Microsoft Edge, then Playwright or system Chromium.
 
-    The bundled browser is preferred because it matches the driver; a machine
-    that has Chromium but has never run ``playwright install`` is the common
-    case here, and launching it directly is what keeps the feature working
-    there.
+    Playwright exposes Edge through Chromium's ``msedge`` channel. This uses a
+    fresh, temporary browser context; it does not attach to the operator's
+    everyday Edge profile. In WSL, Edge is only selected when Playwright can
+    launch an Edge installation visible to Linux; otherwise the Chromium
+    fallback keeps browsing available.
     """
     headless = os.environ.get("ZIMZILLA_BROWSER_HEADED") not in ("1", "true", "yes")
     args = [
-        "--disable-blink-features=AutomationControlled",
         "--disable-dev-shm-usage",
         "--no-first-run",
         "--no-default-browser-check",
         "--hide-scrollbars",
     ]
     kwargs = {"headless": headless, "args": args}
+    browser_choice = os.environ.get("ZIMZILLA_BROWSER", "auto").strip().lower()
+    failures = []
+
+    if browser_choice in ("auto", "edge", "msedge"):
+        try:
+            return playwright.chromium.launch(channel="msedge", **kwargs)
+        except Exception as exc:  # Edge is optional, especially in WSL.
+            failures.append(f"Edge: {exc}")
+            if browser_choice in ("edge", "msedge"):
+                raise BrowserError(
+                    "Microsoft Edge is unavailable to this Playwright runtime; "
+                    "in WSL, install a Linux-visible Edge or set "
+                    "ZIMZILLA_BROWSER=chromium"
+                ) from exc
+
+    if browser_choice not in ("auto", "edge", "msedge", "chromium", "chrome"):
+        raise BrowserError(
+            "ZIMZILLA_BROWSER must be auto, edge, or chromium"
+        )
+
     try:
         return playwright.chromium.launch(**kwargs)
     except Exception as bundled:
         exe = _system_chromium()
         if exe is None:
+            detail = "; ".join(failures)
             raise BrowserError(
-                "no Chromium for Playwright — run `python -m playwright install "
-                "chromium`, or install the chromium package"
+                "no usable browser — install Edge or run `python -m playwright "
+                "install chromium`" + (f" ({detail})" if detail else "")
             ) from bundled
         kwargs["executable_path"] = exe
         try:
@@ -720,13 +731,10 @@ def capture(
         try:
             context = browser.new_context(
                 viewport=VIEWPORT,
-                user_agent=USER_AGENT,
                 locale="en-US",
                 color_scheme="light",
                 ignore_https_errors=False,
             )
-            context.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
             jar = _cookies(cookies)
             if jar:
                 try:

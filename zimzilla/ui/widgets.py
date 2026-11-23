@@ -276,6 +276,8 @@ class HeaderBar(Horizontal):
 class ChatPane(Vertical):
     """Scrollable transcript plus the live streaming line."""
 
+    _SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+
     DEFAULT_CSS = """
     ChatPane {
         width: 1fr;
@@ -587,12 +589,10 @@ class ChatPane(Vertical):
         if w is None:
             return
         w.remove_class("hidden")
-        # The flat text form, not the renderable one: this runs on every delta
-        # and on the cursor blink, and a `Table` or a `Syntax` here would be
-        # rebuilt several times a second for a line that is still arriving.
-        # Markdown is resolved anyway, so the half-written answer reads as
-        # prose rather than as its own source while it streams.
-        body = markdown_text(text, self.palette).copy()
+        # Rebuilding markdown on every tiny SSE delta gets costly on long
+        # replies, especially over Windows-mounted WSL checkouts. Keep the live
+        # slot plain text and render Markdown once when the turn is committed.
+        body = Text(text)
         cursor = "▊" if self._cursor_on else " "
         body.append(cursor, style=f"bold {self.palette.accent}")
         w.update(body)
@@ -619,12 +619,38 @@ class ChatPane(Vertical):
         w = self._spinner_widget()
         if w is None:
             return
+        # The app composes this widget with positional constructor arguments;
+        # keep this state lazy so the spinner works with Textual's composition
+        # lifecycle and with older persisted layouts.
+        if not hasattr(self, "_spinner_text"):
+            self._spinner_text = ""
+            self._spinner_frame = 0
+            self._spinner_timer = None
         if not text:
+            self._spinner_text = ""
+            if self._spinner_timer is not None:
+                self._spinner_timer.stop()
+                self._spinner_timer = None
             w.update("")
             w.add_class("hidden")
             return
+        self._spinner_text = text
+        if self._spinner_timer is None:
+            self._spinner_timer = self.set_interval(0.08, self._tick_spinner)
         w.remove_class("hidden")
-        w.update(Text(text, style=f"bold {self.palette.accent}"))
+        self._tick_spinner()
+
+    def _tick_spinner(self) -> None:
+        if not self._spinner_text:
+            return
+        w = self._spinner_widget()
+        if w is None:
+            return
+        frame = self._SPINNER_FRAMES[self._spinner_frame % len(self._SPINNER_FRAMES)]
+        self._spinner_frame += 1
+        w.remove_class("hidden")
+        w.update(Text(f"{frame} {self._spinner_text}",
+                      style=f"bold {self.palette.accent}"))
 
     def clear_spinner(self) -> None:
         self.set_spinner("")

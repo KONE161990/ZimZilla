@@ -21,6 +21,10 @@
 
 set -euo pipefail
 
+# Optional ProjectDiscovery tools installed with Go live here. Expose them to
+# the launcher so /bug-hunt sees the same tool inventory as the installer.
+export PATH="$HOME/go/bin:$PATH"
+
 # Resolve this script's directory without `readlink -f`: GNU's -f is not on
 # macOS (BSD readlink has no -f), so symlinks are followed by hand.
 _self_path="${BASH_SOURCE[0]}"

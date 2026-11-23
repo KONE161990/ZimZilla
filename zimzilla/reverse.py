@@ -31,9 +31,16 @@ does the work, under the operator's own mode and scope rules.
 from __future__ import annotations
 
 import hashlib
+import html
+import ipaddress
+import socket
 import re
 import shutil
 import struct
+import urllib.error
+import urllib.parse
+import urllib.request
+from html.parser import HTMLParser
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -119,6 +126,93 @@ _MAX_SCAN = 4 * 1024 * 1024
 #: archive, not an exhaustive index — an APK routinely holds thousands of
 #: resource files and the agent needs the thirteen that carry logic.
 _MAX_MEMBERS = 40
+
+# Remote site mapping is deliberately a small, read-only sample. It is not a
+# crawler or vulnerability scanner: five same-origin pages, sequential GETs.
+_SITE_PAGE_LIMIT = 5
+_SITE_BODY_LIMIT = 512 * 1024
+_SITE_TIMEOUT = 12
+
+
+@dataclass
+class SitePage:
+    url: str
+    status: int
+    title: str = ""
+    links: list[str] = field(default_factory=list)
+    forms: list[str] = field(default_factory=list)
+    scripts: list[str] = field(default_factory=list)
+    text: str = ""
+
+
+@dataclass
+class SiteMap:
+    url: str
+    host: str
+    status: int
+    title: str = ""
+    technologies: list[str] = field(default_factory=list)
+    pages: list[SitePage] = field(default_factory=list)
+    forms: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    prompt: str = ""
+
+
+class _SiteHTML(HTMLParser):
+    """Extract a small structural summary without executing page scripts."""
+
+    def __init__(self, base_url: str):
+        super().__init__(convert_charrefs=True)
+        self.base_url = base_url
+        self.title = ""
+        self.links: list[str] = []
+        self.forms: list[str] = []
+        self.scripts: list[str] = []
+        self._in_title = False
+        self._form: dict[str, object] | None = None
+        self._text: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs):
+        attrs = dict(attrs)
+        if tag == "title":
+            self._in_title = True
+        elif tag == "a" and attrs.get("href"):
+            self._add_url(self.links, attrs["href"])
+        elif tag == "script" and attrs.get("src"):
+            self._add_url(self.scripts, attrs["src"])
+        elif tag == "form":
+            self._form = {"method": (attrs.get("method") or "GET").upper(),
+                          "action": urllib.parse.urljoin(self.base_url,
+                                                         attrs.get("action") or self.base_url),
+                          "fields": []}
+        elif tag in ("input", "select", "textarea", "button") and self._form is not None:
+            name = attrs.get("name")
+            if name:
+                self._form["fields"].append(f"{tag}:{name}")
+
+    def handle_endtag(self, tag: str):
+        if tag == "title":
+            self._in_title = False
+        elif tag == "form" and self._form is not None:
+            fields = ", ".join(self._form["fields"][:20]) or "no named fields"
+            self.forms.append(
+                f"{self._form['method']} {self._form['action']} [{fields}]"
+            )
+            self._form = None
+
+    def handle_data(self, data: str):
+        value = " ".join(data.split())
+        if not value:
+            return
+        if self._in_title:
+            self.title = (self.title + " " + value).strip()[:240]
+        elif len(" ".join(self._text)) < 1200:
+            self._text.append(value)
+
+    def _add_url(self, items: list[str], raw: str) -> None:
+        absolute = urllib.parse.urljoin(self.base_url, html.unescape(raw)).split("#", 1)[0]
+        if absolute not in items and len(items) < 80:
+            items.append(absolute)
 
 
 def human_size(n: int) -> str:
@@ -274,6 +368,151 @@ def identify(path: Path) -> Artifact:
     if art.is_container:
         art.entries = _container_members(path)
     return art
+
+
+def _public_site_url(raw: str, expected_host: str | None = None) -> urllib.parse.SplitResult:
+    """Validate a public HTTP(S) URL before the read-only site mapper fetches it."""
+    parsed = urllib.parse.urlsplit(raw)
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+        raise ValueError("site target must be an absolute http:// or https:// URL")
+    if parsed.username or parsed.password:
+        raise ValueError("credentials in site URLs are not supported")
+    host = parsed.hostname.rstrip(".").lower()
+    if expected_host and host != expected_host:
+        raise ValueError("redirects to a different host are not followed")
+    try:
+        addresses = {item[4][0] for item in socket.getaddrinfo(
+            host, parsed.port or (443 if parsed.scheme.lower() == "https" else 80),
+            type=socket.SOCK_STREAM,
+        )}
+    except OSError as exc:
+        raise ValueError(f"DNS lookup failed for {host}: {exc}") from None
+    if not addresses or any(not ipaddress.ip_address(addr.split("%")[0]).is_global
+                            for addr in addresses):
+        raise ValueError("site mapping only permits public Internet addresses")
+    return parsed
+
+
+class _SameHostRedirect(urllib.request.HTTPRedirectHandler):
+    def __init__(self, host: str, scheme: str, port: int):
+        super().__init__()
+        self.host = host
+        self.origin = (scheme, port)
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = _public_site_url(newurl, expected_host=self.host)
+        scheme = redirected.scheme.lower()
+        port = redirected.port or (443 if scheme == "https" else 80)
+        if (scheme, port) != self.origin:
+            raise ValueError("redirects outside the original site origin are not followed")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def map_site(raw_url: str) -> SiteMap:
+    """Fetch and summarize up to five public same-origin pages with GET only."""
+    parsed = _public_site_url(raw_url)
+    host = parsed.hostname.rstrip(".").lower()
+    scheme = parsed.scheme.lower()
+    origin = (scheme, host, parsed.port or (443 if scheme == "https" else 80))
+    start = urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc,
+                                     parsed.path or "/", parsed.query, ""))
+    opener = urllib.request.build_opener(
+        _SameHostRedirect(host, scheme, origin[2]))
+    queue = [start]
+    seen: set[str] = set()
+    pages: list[SitePage] = []
+    notes: list[str] = []
+    technologies: list[str] = []
+
+    while queue and len(pages) < _SITE_PAGE_LIMIT:
+        url = queue.pop(0)
+        normalized = urllib.parse.urlsplit(url)
+        normalized_scheme = normalized.scheme.lower()
+        normalized_origin = (
+            normalized_scheme, (normalized.hostname or "").lower(),
+            normalized.port or (443 if normalized_scheme == "https" else 80),
+        )
+        if normalized_origin != origin:
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        request = urllib.request.Request(
+            url, headers={"User-Agent": "ZimZilla-SiteMap/1.0",
+                          "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.1"},
+            method="GET",
+        )
+        try:
+            with opener.open(request, timeout=_SITE_TIMEOUT) as response:
+                status = response.status
+                content_type = response.headers.get("Content-Type", "")
+                body = response.read(_SITE_BODY_LIMIT + 1)
+                if len(body) > _SITE_BODY_LIMIT:
+                    notes.append(f"{url}: response truncated at {_SITE_BODY_LIMIT} bytes")
+                    body = body[:_SITE_BODY_LIMIT]
+                if status < 200 or status >= 300:
+                    notes.append(f"{url}: HTTP {status}")
+                    continue
+                if "html" not in content_type.lower():
+                    notes.append(f"{url}: skipped non-HTML response ({content_type or 'unknown type'})")
+                    continue
+                decoded = body.decode(response.headers.get_content_charset() or "utf-8",
+                                      errors="replace")
+                parser = _SiteHTML(url)
+                parser.feed(decoded)
+                page = SitePage(url=url, status=status, title=parser.title,
+                                links=parser.links, forms=parser.forms,
+                                scripts=parser.scripts,
+                                text=" ".join(parser._text)[:1200])
+                pages.append(page)
+                server = response.headers.get("Server", "")
+                powered = response.headers.get("X-Powered-By", "")
+                for value in (server, powered):
+                    if value and value not in technologies:
+                        technologies.append(value)
+                if len(pages) < _SITE_PAGE_LIMIT:
+                    for link in parser.links:
+                        linked = urllib.parse.urlsplit(link)
+                        linked_scheme = linked.scheme.lower()
+                        linked_origin = (
+                            linked_scheme, (linked.hostname or "").lower(),
+                            linked.port or (443 if linked_scheme == "https" else 80),
+                        )
+                        if linked_origin == origin and link not in seen and link not in queue:
+                            queue.append(link)
+        except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+            notes.append(f"{url}: {type(exc).__name__}: {exc}")
+
+    if not pages and not notes:
+        notes.append("No same-origin HTML pages could be mapped.")
+    forms = list(dict.fromkeys(form for page in pages for form in page.forms))
+    root_page = pages[0] if pages else None
+    summary = [
+        "Read-only site map (GET requests only; no form submission, crawling beyond",
+        f"{_SITE_PAGE_LIMIT} same-origin pages, or vulnerability probes).",
+        f"Target: {start}",
+        f"Observed HTML pages: {len(pages)}",
+        f"Response headers suggest: {', '.join(technologies) if technologies else 'no server technology headers'}",
+    ]
+    for page in pages:
+        summary.append(f"\nPAGE {page.status} {page.url}\nTitle: {page.title or '(none)'}")
+        if page.forms:
+            summary.append("Forms: " + " | ".join(page.forms))
+        if page.scripts:
+            summary.append("Scripts: " + ", ".join(page.scripts[:12]))
+        summary.append("Visible text: " + (page.text or "(none)"))
+    if notes:
+        summary.append("\nCoverage notes:\n- " + "\n- ".join(notes))
+    prompt = (
+        "Explain the structure and observable behavior of this public website from "
+        "the bounded read-only map below. Do not claim vulnerabilities from this "
+        "map. Describe pages, forms, scripts, and likely client-side architecture; "
+        "separate observations from hypotheses. If deeper inspection is needed, "
+        "ask what the operator wants to learn.\n\n" + "\n".join(summary)
+    )
+    return SiteMap(url=start, host=host, status=root_page.status if root_page else 0,
+                   title=root_page.title if root_page else "", technologies=technologies,
+                   pages=pages, forms=forms, notes=notes, prompt=prompt)
 
 
 def _container_members(path: Path) -> list[tuple[str, int]]:
@@ -1156,8 +1395,8 @@ RULES FOR THE WORK THAT FOLLOWS THE CHOICE (state them, do not perform them)
 # ---------------------------------------------------------------------------
 
 USAGE_LINES: tuple[tuple[str, str], ...] = (
-    ("/reverse-engineer <path>",
-     "map an artifact, then choose what to change"),
+    ("/reverse-engineer <file-or-url>",
+     "map an artifact or a bounded public-site sample, then choose what to learn"),
     ("/reverse-engineer <path> --map",
      "map it only — no model turn, nothing sent anywhere"),
     ("/reverse-engineer-tools [kind]",

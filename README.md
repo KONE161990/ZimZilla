@@ -353,6 +353,13 @@ yourself — it cannot share this environment (`litellm[proxy]` requires
 profile `./setup.sh` wrote before the harness starts, so a normal launch needs
 nothing exported by hand.
 
+Optional WSL security-scanner tools are separate from the Python requirements
+and the provider setup. From the checkout, run `bash install-pentest-tools.sh`;
+it installs supported Debian/Ubuntu packages and, when Go is already available,
+the ProjectDiscovery command-line tools. Restart ZimZilla afterward. `/bug-hunt`
+checks which binaries and wordlists are actually available in WSL and uses only
+those; missing tools are reported as coverage gaps.
+
 Out of the box it runs **`deepseek-v4.1-flash`** against Logfare. Switch any
 time with `/model`, or override before launch:
 
@@ -2347,22 +2354,27 @@ you see, export cookies once — a Playwright storage-state JSON file
 guesses a credential.
 
 **Scope and limits.** A URL whose host is in `out-of-scope.yaml` is refused
-*before* Chromium opens. The browser is read-only: it does not post, like,
+*before* the browser opens. Microsoft Edge is preferred when Playwright can
+see it; otherwise the bundled or system Chromium is used. Each capture gets a
+fresh temporary profile and does not attach to your normal Edge session. Set
+`ZIMZILLA_BROWSER=edge` to require Edge, or `ZIMZILLA_BROWSER=chromium` to
+select Chromium. In WSL, the Windows Edge installation may not be visible to
+Linux Playwright; Edge must be installed in the Linux environment for this
+direct launch path. The browser is read-only: it does not post, like,
 follow, purchase or log in. It does not bypass a CAPTCHA, a paywall or DRM, and
 a site that refuses a headless browser is reported as refusing it. Screenshots
 are capped at 4200px tall and six attachments per capture; a page that is
 nothing but a 40,000px feed is summarised from its top screens and its text.
 
-**Install.** The Python package is in `requirements.txt`; the browser binary is
-a separate download:
+**Install.** The Python package is in `requirements.txt`; if Edge is not
+available, the Chromium browser binary is a separate download:
 
 ```bash
 python -m playwright install chromium
 ```
 
 A machine that already has Chromium does not need that line — `browser.py`
-launches the system binary when Playwright's bundled one is absent, which is
-what makes `/see` work out of the box here.
+launches the system binary when Playwright's bundled one is absent.
 
 ---
 

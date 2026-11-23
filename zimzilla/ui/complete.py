@@ -76,6 +76,7 @@ SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/zim-inferbase", "switch upstream to Inferbase (direct, free price band)"),
     ("/zim-flex", "switch upstream to the Flex playground (direct, no key, chat only)"),
     ("/zim-gemini", "switch upstream to Google Gemini (direct, free AI Studio tier)"),
+    ("/coli", "switch to Colibri running on Windows"),
     ("/zim-antseed", "switch upstream to AntSeed (local buyer, free peers)"),
     ("/tokenharbour-api-setup", "store your TokenHarbour API key"),
     ("/tokenharbour-models", "fetch the live catalog; show what is free"),
